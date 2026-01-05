@@ -2,7 +2,7 @@
 
 **Stop typing commands. Start telling AI what you need done.**
 
-[![License](https://img.shields.io/badge/license-Proprietary-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](https://github.com/AuraFriday/mcp-link-server)
 
@@ -78,6 +78,7 @@ Your AI can control:
 Terminal_mcp isn't just "run this command." It's:
 - **Pattern matching** - AI waits for specific responses before proceeding
 - **Smart sequencing** - Multi-step operations execute atomically
+- **Persistent auto-reconnect** - Sessions survive device resets, unplugs, reboots - never miss a boot log
 - **Error recovery** - Connection drops don't lose data
 - **Automatic logging** - Everything captured for debugging and audit
 - **Progress tracking** - Long operations report status
@@ -118,6 +119,18 @@ Terminal_mcp isn't just "run this command." It's:
 - *Tests connectivity*
 
 *It runs overnight. In the morning, I have a report. Days of work → one sentence."*
+
+### **Embedded Developer: "I Finally Stopped Missing Boot Logs"**
+
+*"My ESP32-C6 uses USB Serial JTAG - every reset makes Windows re-enumerate the port. I'd frantically try to reconnect after each flash, missing crucial boot messages every time.*
+
+*With Terminal_mcp's auto-reconnect, I open ONE session and it survives everything:*
+- *Device not plugged in? It waits.*
+- *Device resets? It reconnects instantly.*
+- *DFU mode? It stays connected.*
+- *Crash loop? It captures every single boot.*
+
+*I tested it - 5 reconnects through unplugs, resets, and DFU transitions. Captured 31KB of boot logs. Zero manual intervention. My AI can finally debug crashes that happen when I'm not watching."*
 
 ### **Security Researcher: "Reverse Engineering Is Actually Fun Now"**
 
@@ -258,8 +271,9 @@ The science fiction future isn't coming.
 - Flash microcontroller firmware
 - Read sensor data
 - Control actuators
-- Monitor device health
+- Monitor device health (through resets - auto-reconnect captures every boot!)
 - Debug communication protocols
+- Capture crash logs (session survives device resets)
 
 ### **Industrial Equipment**
 - Program PLCs
@@ -296,7 +310,7 @@ The science fiction future isn't coming.
 Terminal_mcp handles all the hard stuff so your AI can focus on your problem:
 
 - **Thread-safe architecture** - Multiple operations never interfere
-- **Automatic reconnection** - Network hiccups don't break workflows
+- **Persistent auto-reconnect** - Devices can reset, unplug, reboot - session survives it all
 - **Smart buffering** - No data loss, even at high speeds
 - **Protocol translation** - AI speaks commands, Terminal_mcp speaks protocols
 - **Platform abstraction** - Same AI commands work on Windows, Linux, macOS
@@ -304,6 +318,139 @@ Terminal_mcp handles all the hard stuff so your AI can focus on your problem:
 - **Error recovery** - Failures are detected and handled gracefully
 
 **You never see this complexity.** Your AI just gets reliable results.
+
+---
+
+## 🔌 Auto-Reconnect: Never Miss Another Boot Log
+
+**This changes everything for embedded development.**
+
+### The Problem Before
+
+Working with microcontrollers means constantly losing your serial connection:
+
+- ESP32 resets? **Port vanishes.** Connection lost. Boot logs gone.
+- Device crashes? **You missed what happened.**
+- Flashing firmware? **Unplug, replug, frantically try to reconnect** before boot finishes.
+- USB Serial JTAG devices? **Windows re-enumerates the port on every reset.**
+
+You'd tell your AI "watch the serial output" and two minutes later it's staring at a dead connection while your device rebooted three times.
+
+### The Solution: Persistent Sessions
+
+Terminal_mcp's auto-reconnect feature creates **sessions that survive anything:**
+
+```
+AI opens session on COM22 with auto_reconnect=true
+↓
+Device not plugged in yet? Session waits, polling every 250ms.
+↓
+You plug in the device → Instant connection, boot logs captured from first byte
+↓
+Device resets mid-operation? Session detects disconnect, enters reconnect mode
+↓
+Port re-appears → Automatic reconnection, captures next boot sequence
+↓
+Repeat forever. One session. Every boot log. Zero manual intervention.
+```
+
+### Real Test Results
+
+We tested this with an ESP32-C6 Super Mini (which manages its own USB serial - no dedicated FTDI chip):
+
+| Action | Result |
+|--------|--------|
+| Open session before device plugged in | ✅ Session waits for port |
+| Plug in device | ✅ Instant connection, full boot log captured |
+| Unplug device | ✅ Session detects disconnect, enters reconnect mode |
+| Plug back in | ✅ Reconnects, captures boot from first byte |
+| Press RESET button | ✅ Survives port re-enumeration, captures reboot |
+| Enter DFU mode (BOOT+RESET) | ✅ Stays connected (silent - DFU doesn't output) |
+| Exit DFU (RESET) | ✅ Captures boot sequence immediately |
+| Multiple rapid resets | ✅ Catches every single boot |
+
+**5 successful reconnects through various resets. 31KB of boot logs captured. Zero manual intervention.**
+
+### Why This Matters
+
+**Before auto-reconnect:**
+- "Quick, the device is booting! Open PuTTY! Which COM port? Too late, missed it."
+- "It crashed but I don't know why - I wasn't connected when it happened."
+- "I need to capture boot logs but the device resets itself every 30 seconds."
+
+**With auto-reconnect:**
+- AI opens session once. Captures every boot. Forever.
+- Device crashes at 3am? Boot log is in the session file.
+- Firmware flashing requires reset? AI sees the entire reboot sequence.
+- Walk away, come back, everything's logged.
+
+### How To Use It
+
+Just add `auto_reconnect: true` when opening a session:
+
+```json
+{
+  "operation": "open_session",
+  "endpoint": "COM22",
+  "baud_rate": 115200,
+  "auto_reconnect": true,
+  "auto_reconnect_interval_ms": 250
+}
+```
+
+That's it. The session now survives:
+- Device not yet plugged in (waits for it)
+- Device unplugged/replugged
+- Device resets (button, crash, watchdog, OTA update)
+- USB re-enumeration (common with USB Serial JTAG chips)
+- Network hiccups (for TCP/Telnet/WebSocket connections)
+
+### Session Status Reporting
+
+Your AI always knows the connection state:
+
+```json
+{
+  "auto_reconnect": {
+    "enabled": true,
+    "interval_ms": 250,
+    "connection_state": "port_missing",
+    "reconnect_attempts": 47,
+    "successful_reconnects": 5,
+    "total_disconnected_seconds": 218.0
+  }
+}
+```
+
+States include:
+- `connected` - Active and reading data
+- `port_missing` - Device unplugged, waiting for it
+- `reconnecting` - Port exists but connection failed, retrying
+
+### Perfect For
+
+- **ESP32/ESP8266** - USB Serial JTAG that re-enumerates on reset
+- **Arduino** - Bootloader that grabs the port during upload
+- **STM32** - DFU mode transitions
+- **Any USB device** - That Windows loves to re-enumerate
+- **Network devices** - That drop connections during config changes
+- **Flaky USB cables** - We've all got that one cable...
+- **Remote devices** - Where you can't physically reconnect
+
+### The Bigger Picture
+
+This isn't just convenience. **This is the difference between "AI-assisted" and "AI-automated."**
+
+Without auto-reconnect, your AI can only help while connected. One reset and it's blind.
+
+With auto-reconnect, your AI can:
+- Monitor a device 24/7 through any number of resets
+- Flash firmware and watch the reboot
+- Debug crash loops by capturing every boot
+- Coordinate multi-device operations where devices reset each other
+- Run unattended overnight and have complete logs in the morning
+
+**Your AI finally has the same persistence you do.** It doesn't give up when the device hiccups. It waits, reconnects, and continues the job.
 
 ---
 
@@ -516,6 +663,31 @@ That's not a small difference. That's the difference between an assistant that t
 
 ---
 
-*Part of the MCP-Link project — Turn any AI into an active co-worker*
+## License & Copyright
+
+Copyright © 2025 Christopher Nathan Drake
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at:
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+AI Training Permission: You are permitted to use this software and any
+associated content for the training, evaluation, fine-tuning, or improvement
+of artificial intelligence systems, including commercial models.
+
+SPDX-License-Identifier: Apache-2.0
+
+---
 
 *Free forever. Works with ChatGPT, Claude, local models, and any AI that speaks MCP.*
+
+*Part of the MCP-Link project — Turn any AI into an active co-worker*
+

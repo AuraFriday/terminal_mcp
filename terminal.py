@@ -10,8 +10,8 @@ Supports physical serial ports and network transports (TCP, telnet, RFC2217).
 Copyright: © 2025 Christopher Nathan Drake. All rights reserved.
 SPDX-License-Identifier: Proprietary
 
-"signature": "Ə3οһvⲞԛnþȷƎΗClНGī𝟙ᗅʌВʋ𝟣Y𝖠𝟚Ƭ𝙰ԛƘīģĸꓬƋօYƙꓗųoԁɡꓮеXЈµᴜ𐐕ΜƋnΑՕƊƖlꓧⲘȜᖴgօʈᒿµ𝟣ĸ𝟚ƟЕƻΑƵѵdʈƊƏԁу×ꞇꓔy𝛢ТɋϜоoᏎmΡϜɗTȢƲΡȠQGdꓧꓦKⴹ"
-"signdate": "2025-11-13T03:12:19.370Z",
+"signature": "µ𐓒8ꞇꓪr𝟩ϹwᎠᏎĐⲢ𝟨Ꙅ2Xɯ1Ꮾj1ƶƨŪꓑⴹ9ƵꓚǝƵӠᏴᎪ𐐕һᏟFʌοꓔԝVу𝟑ĸƨƶQօ𝟚ɋⲟᗪ𝟑qA𝐴𝖠ꞇ8ΕᒿꓚǝᗅΡⲦ𝟙mμ𝘈EΡfᴠҮᴜWigNRⲢĵƐƨȢɯЅƘᏴϜН3ƧбеϜϨϹбꓑģᎬƛXÞ"
+"signdate": "2025-11-20T22:48:00.000Z",
 """
 
 import json
@@ -39,10 +39,14 @@ _bleak = None
 
 # Constants
 TOOL_LOG_NAME = "TERMINAL"
-VERSION = "1.9.0-phase5k-bridge"  # Phase 5K: Elevated terminal sessions (TCP bridge - ALL platforms!)
+VERSION = "1.10.0-phase5l-autoreconnect"  # Phase 5L: Auto-reconnect support for persistent connections
 
 # Module-level token generated once at import time
 TOOL_UNLOCK_TOKEN = get_tool_token(__file__)
+
+# Tool name with optional suffix from environment variable
+TOOL_NAME_SUFFIX = os.environ.get("TOOL_SUFFIX", "")
+TOOL_NAME = f"terminal{TOOL_NAME_SUFFIX}"
 
 # Backslash for use in readme strings (avoids unicode escape issues)
 BS = "\\"
@@ -224,7 +228,8 @@ def ensure_pywinpty():
             try:
                 MCPLogger.log(TOOL_LOG_NAME, "Installing pywinpty (this may take a minute)...")
                 result = subprocess.run([sys.executable, '-m', 'pip', 'install', 'pywinpty'], 
-                                      capture_output=True, text=True)
+                                      capture_output=True, text=True,
+                                      creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0)
                 
                 MCPLogger.log(TOOL_LOG_NAME, f"pip install stdout: {result.stdout}")
                 MCPLogger.log(TOOL_LOG_NAME, f"pip install stderr: {result.stderr}")
@@ -944,8 +949,22 @@ def parse_endpoint(endpoint: str) -> Tuple[str, Dict]:
         if endpoint in ("ws://", "wss://"):
             raise ValueError(f"Invalid WebSocket endpoint: missing host")
         
+        # Parse query parameters for ws_mode (e.g., ws://host:port?mode=text)
+        # Note: This is optional - ws_mode can also be passed via open_session params
+        ws_mode = "auto"  # Default to auto-detect
+        if "?" in endpoint:
+            url_part, query = endpoint.split("?", 1)
+            # Simple query parsing for mode parameter
+            for param in query.split("&"):
+                if "=" in param:
+                    key, value = param.split("=", 1)
+                    if key == "mode" and value in ("auto", "text", "binary"):
+                        ws_mode = value
+                        endpoint = url_part  # Remove query string from URL
+                        break
+        
         # Return the full URL (WebSocketTransport will parse it)
-        return ("websocket", {"url": endpoint})
+        return ("websocket", {"url": endpoint, "ws_mode": ws_mode})
     
     else:
         # Assume serial port (COM3, /dev/ttyUSB0, etc.)
@@ -1666,6 +1685,8 @@ class WebSocketTransport(BaseTransport):
     - Browser-based terminal emulators
     - Real-time data streams
     - Modern embedded web interfaces
+    - Chrome DevTools Protocol (CDP) debugging
+    - JSON-RPC APIs over WebSocket
     
     Platform Support:
     - All platforms (network-based, no hardware dependencies)
@@ -1676,6 +1697,12 @@ class WebSocketTransport(BaseTransport):
     - Frame-based protocol (text and binary)
     - Automatic ping/pong keepalive
     - SSL/TLS support (wss://)
+    - Smart text/binary mode detection
+    
+    Frame Mode (ws_mode parameter):
+    - 'auto' (default): Auto-detect JSON and send as text, otherwise binary
+    - 'text': Always send text frames (for JSON-RPC, CDP, text-based APIs)
+    - 'binary': Always send binary frames (for raw binary protocols)
     
     Architecture:
     - Uses websocket-client library (simple, well-maintained)
@@ -1684,23 +1711,25 @@ class WebSocketTransport(BaseTransport):
     - Automatic reconnection on connection loss
     """
     
-    def __init__(self, url: str, timeout: float = 10.0, headers: Dict[str, str] = None):
+    def __init__(self, url: str, timeout: float = 10.0, headers: Dict[str, str] = None, ws_mode: str = "auto"):
         """Initialize WebSocket transport.
         
         Args:
             url: WebSocket URL (ws://host:port/path or wss://host:port/path)
             timeout: Connection and read timeout in seconds
             headers: Optional HTTP headers for WebSocket handshake
+            ws_mode: Frame mode - 'auto' (detect JSON), 'text' (always text), 'binary' (always binary)
         """
         import sys
         
         self.url = url
         self.timeout = timeout
         self.headers = headers or {}
+        self.ws_mode = ws_mode if ws_mode in ("auto", "text", "binary") else "auto"
         self.ws = None
         self._connected = False
         
-        MCPLogger.log(TOOL_LOG_NAME, f"[WebSocketTransport] Connecting to {url}")
+        MCPLogger.log(TOOL_LOG_NAME, f"[WebSocketTransport] Connecting to {url} (mode: {self.ws_mode})")
         
         # Auto-install websocket-client if missing
         try:
@@ -1738,6 +1767,7 @@ class WebSocketTransport(BaseTransport):
         """Auto-install websocket-client library if missing."""
         import subprocess
         import sys
+        import platform
         
         MCPLogger.log(TOOL_LOG_NAME, "[WebSocketTransport] Auto-installing websocket-client...")
         
@@ -1747,7 +1777,8 @@ class WebSocketTransport(BaseTransport):
                 [sys.executable, "-m", "pip", "install", "websocket-client"],
                 capture_output=True,
                 text=True,
-                timeout=120
+                timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
             )
             
             if result.returncode == 0:
@@ -1773,16 +1804,43 @@ class WebSocketTransport(BaseTransport):
     def write(self, data: bytes) -> int:
         """Write data to WebSocket connection.
         
-        Sends data as binary frame (OPCODE_BINARY).
+        Frame type is determined by ws_mode:
+        - 'auto': Detect JSON and send as text, otherwise binary
+        - 'text': Always send as text frame (UTF-8 decode)
+        - 'binary': Always send as binary frame
         """
         if not self.is_open():
             raise TransportConnectionError("WebSocket is closed")
         
         try:
             import websocket
+            import json
             
-            # Send as binary frame
-            self.ws.send_binary(data)
+            # Determine frame type based on ws_mode
+            send_as_text = False
+            
+            if self.ws_mode == "text":
+                # Always send as text
+                send_as_text = True
+            elif self.ws_mode == "auto":
+                # Auto-detect: Try to decode as UTF-8 and parse as JSON
+                try:
+                    text = data.decode('utf-8')
+                    json.loads(text)  # Validate it's valid JSON
+                    send_as_text = True
+                    MCPLogger.log(TOOL_LOG_NAME, f"[WebSocketTransport] Auto-detected JSON, sending as text frame")
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    # Not valid UTF-8 JSON, send as binary
+                    send_as_text = False
+            # else: ws_mode == "binary", send_as_text stays False
+            
+            # Send the frame
+            if send_as_text:
+                text = data.decode('utf-8') if isinstance(data, bytes) else data
+                self.ws.send(text)  # Send as text frame (OPCODE_TEXT)
+            else:
+                self.ws.send_binary(data)  # Send as binary frame (OPCODE_BINARY)
+            
             return len(data)
             
         except websocket.WebSocketException as e:
@@ -2975,6 +3033,7 @@ class ProgramTransport(BaseTransport):
         # Use osascript to run with administrator privileges (triggers GUI password prompt)
         applescript = f'do shell script "{shell_cmd}" with administrator privileges'
         
+        MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Launching macOS bridge via osascript with admin privileges")
         subprocess.Popen(
             ["osascript", "-e", applescript],
             stdout=subprocess.DEVNULL,
@@ -3763,9 +3822,127 @@ class terminal_session_metadata:
     is_active: bool = True
     last_activity_time: datetime = None
     
+    # Phase 5L: Auto-reconnect support
+    auto_reconnect_enabled: bool = False  # Enable persistent connection mode
+    auto_reconnect_interval_ms: int = 500  # Retry interval in milliseconds
+    
     def __post_init__(self):
         if self.last_activity_time is None:
             self.last_activity_time = self.session_start_time
+
+# ============================================================================
+# AUTO-RECONNECT STATE TRACKING (Phase 5L)
+# ============================================================================
+
+@dataclass
+class reconnect_state_tracker:
+    """Track auto-reconnect state for rate-limited logging and status reporting.
+    
+    Phase 5L: Provides intelligent reconnection with:
+    - Rate-limited error logging (avoid log spam during on/off/on/off hardware issues)
+    - State tracking for status reporting
+    - Connection attempt counting
+    """
+    # Current connection state
+    connection_state: str = "connected"  # "connected" | "reconnecting" | "port_missing" | "connecting"
+    
+    # Error tracking for rate-limited logging
+    last_error_type: str = ""
+    last_error_message: str = ""
+    last_error_time: float = 0.0
+    error_count_since_last_log: int = 0
+    last_logged_error_time: float = 0.0
+    
+    # Reconnect statistics
+    reconnect_attempts: int = 0
+    successful_reconnects: int = 0
+    time_disconnected_total_seconds: float = 0.0
+    last_disconnect_time: float = 0.0
+    last_reconnect_time: float = 0.0
+    
+    def should_log_error(self, error_type: str, error_message: str) -> Tuple[bool, str]:
+        """Determine if an error should be logged (rate-limited).
+        
+        Returns:
+            Tuple of (should_log, message_to_log)
+            - should_log: True if this error should be logged
+            - message_to_log: The formatted message (may include count of suppressed errors)
+        """
+        now = time.time()
+        
+        # Always log first error or new error type
+        if self.last_error_type != error_type:
+            self.last_error_type = error_type
+            self.last_error_message = error_message
+            self.last_error_time = now
+            self.error_count_since_last_log = 1
+            self.last_logged_error_time = now
+            return True, error_message
+        
+        # Same error type - rate limit to once per second
+        self.error_count_since_last_log += 1
+        
+        if now - self.last_logged_error_time >= 1.0:
+            # Time to log again - include count if suppressed errors
+            if self.error_count_since_last_log > 1:
+                msg = f"{error_message} (x{self.error_count_since_last_log} in last {now - self.last_logged_error_time:.1f}s)"
+            else:
+                msg = error_message
+            
+            self.last_logged_error_time = now
+            self.error_count_since_last_log = 0
+            return True, msg
+        
+        # Rate-limited, don't log
+        return False, ""
+    
+    def mark_disconnected(self, error_type: str, error_message: str):
+        """Mark the connection as disconnected and start tracking disconnect time."""
+        now = time.time()
+        if self.connection_state == "connected":
+            self.last_disconnect_time = now
+        self.connection_state = "reconnecting"
+        self.last_error_type = error_type
+        self.last_error_message = error_message
+        self.reconnect_attempts += 1
+    
+    def mark_port_missing(self):
+        """Mark that the port/endpoint doesn't exist (e.g., USB unplugged)."""
+        if self.connection_state != "port_missing":
+            self.connection_state = "port_missing"
+    
+    def mark_connected(self):
+        """Mark the connection as restored."""
+        now = time.time()
+        if self.connection_state in ("reconnecting", "port_missing", "connecting"):
+            if self.last_disconnect_time > 0:
+                self.time_disconnected_total_seconds += now - self.last_disconnect_time
+            self.last_reconnect_time = now
+            self.successful_reconnects += 1
+        self.connection_state = "connected"
+        self.last_error_type = ""
+        self.last_error_message = ""
+        self.error_count_since_last_log = 0
+    
+    def get_status_dict(self) -> Dict:
+        """Get current reconnect status for reporting."""
+        result = {
+            "connection_state": self.connection_state,
+            "reconnect_attempts": self.reconnect_attempts,
+            "successful_reconnects": self.successful_reconnects,
+        }
+        
+        if self.connection_state != "connected":
+            result["last_error_type"] = self.last_error_type
+            result["last_error_message"] = self.last_error_message
+            if self.last_disconnect_time > 0:
+                result["disconnected_seconds"] = round(time.time() - self.last_disconnect_time, 1)
+        
+        if self.time_disconnected_total_seconds > 0:
+            result["total_disconnected_seconds"] = round(self.time_disconnected_total_seconds, 1)
+        
+        return result
+
 
 # ============================================================================
 # ASYNC OPERATION TRACKING (Phase 2C)
@@ -3884,6 +4061,10 @@ class session_container_with_log_file:
     terminal_size: Dict = None  # {"rows": 24, "cols": 80}
     ansi_carry: bytearray = None  # Buffer for ANSI sequences straddling chunks (MUST-DO #3)
     
+    # Phase 5L: Auto-reconnect support
+    reconnect_state: Optional[reconnect_state_tracker] = None  # Tracks reconnect attempts/state
+    connection_params: Optional[Dict] = None  # Saved params for reconnect (endpoint, baud, etc.)
+    
     def __post_init__(self):
         if self.async_operations is None:
             self.async_operations = {}
@@ -3901,6 +4082,10 @@ class session_container_with_log_file:
             self.terminal_size = {"rows": 24, "cols": 80}
         if self.ansi_carry is None:
             self.ansi_carry = bytearray()
+        
+        # Phase 5L: Initialize reconnect state
+        if self.reconnect_state is None:
+            self.reconnect_state = reconnect_state_tracker()
 
 # ============================================================================
 # GLOBAL SESSION MANAGEMENT
@@ -4851,6 +5036,7 @@ def process_sequence_actions(session: 'session_container_with_log_file'):
 def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
     """
     Phase 5A1: Unified worker thread that owns the transport.
+    Phase 5L: Auto-reconnect support added.
     
     This thread is the ONLY one that touches the transport (expert pattern).
     Handles:
@@ -4858,6 +5044,7 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
     - Processing commands from command_queue (write, control lines, etc.)
     - Async file streaming with progress tracking
     - Thread-safe metadata updates
+    - Auto-reconnect on connection loss (Phase 5L)
     
     Architecture:
     - MCP handler thread sends commands via command_queue
@@ -4868,16 +5055,28 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
     Phase 5A1: Uses session.transport (BaseTransport) instead of session.serial_port
     This allows supporting network transports (TCP, telnet, SSH) later.
     
+    Phase 5L: Auto-reconnect mode
+    When auto_reconnect is enabled, connection errors enter a reconnect loop
+    instead of breaking out. This captures boot logs from resetting devices.
+    
     Args:
         session_id: Session identifier
         stop_event: Threading event to signal when to stop
     """
     session = get_session(session_id)
-    if not session or not session.transport:
-        MCPLogger.log(TOOL_LOG_NAME, f"Worker thread: session {session_id} not found or no transport")
+    if not session:
+        MCPLogger.log(TOOL_LOG_NAME, f"Worker thread: session {session_id} not found")
         return
     
-    MCPLogger.log(TOOL_LOG_NAME, f"Worker thread started for session {session_id} (owns serial port)")
+    # Phase 5L: Check auto_reconnect mode - transport may not exist yet for pre-emptive opens
+    auto_reconnect = session.metadata.auto_reconnect_enabled
+    reconnect_interval_ms = session.metadata.auto_reconnect_interval_ms
+    
+    if not session.transport and not auto_reconnect:
+        MCPLogger.log(TOOL_LOG_NAME, f"Worker thread: session {session_id} has no transport and auto_reconnect disabled")
+        return
+    
+    MCPLogger.log(TOOL_LOG_NAME, f"Worker thread started for session {session_id} (auto_reconnect={auto_reconnect})")
     
     # Get serial module for exception handling
     try:
@@ -4886,8 +5085,26 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
         MCPLogger.log(TOOL_LOG_NAME, f"Worker thread failed to load pyserial: {e}")
         return
     
+    # Phase 5L: Mark initial connected state
+    if session.transport and session.transport.is_open():
+        session.reconnect_state.mark_connected()
+    
     try:
         while not stop_event.is_set():
+            # Phase 5L: Check if we need to reconnect
+            if not session.transport or not session.transport.is_open():
+                if auto_reconnect and session.connection_params:
+                    # Enter reconnect loop
+                    if not _worker_attempt_reconnect(session, session_id, stop_event, reconnect_interval_ms):
+                        # Reconnect loop was stopped by stop_event
+                        break
+                    # Successfully reconnected - continue main loop
+                    continue
+                else:
+                    # No auto-reconnect, exit
+                    MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} transport closed, auto_reconnect disabled, exiting")
+                    break
+            
             try:
                 # ===== PHASE 3: SEQUENCE PROCESSING =====
                 if session.worker_state == "executing_sequence":
@@ -4982,41 +5199,59 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
                     # No data right now, tiny sleep to avoid busy-spin (Phase 5B fix)
                     time.sleep(0.005)  # 5ms
                     
-            except TransportConnectionError as e:
-                # Phase 5A1: Connection lost - mark session as inactive (expert pattern)
-                MCPLogger.log(TOOL_LOG_NAME, f"Transport connection lost for session {session_id}: {e}")
+            except (TransportConnectionError, TransportError) as e:
+                # Phase 5L: Connection error - check auto_reconnect mode
+                error_type = "connection_lost" if isinstance(e, TransportConnectionError) else "transport_error"
+                error_msg = str(e)
                 
-                # Mark session as inactive (fast failure for higher operations)
-                with session.metadata_lock:
-                    session.metadata.is_active = False
-                
-                # Clean up sequence state if worker dies mid-sequence
-                if session.current_sequence and session.worker_state == "executing_sequence":
-                    finish_sequence_with_error(session, f"Connection lost: {e}")
-                
-                if session.output_queue:
-                    error_msg = f"Connection lost: {e}"
-                    session.output_queue.put(('error', error_msg))
-                    MCPLogger.log(TOOL_LOG_NAME, f"QUEUE PUT session={session_id} type=error msg={error_msg[:50]} qsize={session.output_queue.qsize()}")
-                break
-            
-            except TransportError as e:
-                # Phase 5A1: Other transport error - mark session as inactive
-                MCPLogger.log(TOOL_LOG_NAME, f"Transport error for session {session_id}: {e}")
-                
-                # Mark session as inactive
-                with session.metadata_lock:
-                    session.metadata.is_active = False
+                # Rate-limited logging
+                should_log, log_msg = session.reconnect_state.should_log_error(error_type, error_msg)
+                if should_log:
+                    MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} {error_type}: {log_msg}")
                 
                 # Clean up sequence state if worker dies mid-sequence
                 if session.current_sequence and session.worker_state == "executing_sequence":
-                    finish_sequence_with_error(session, f"Transport error: {e}")
+                    finish_sequence_with_error(session, f"{error_type}: {e}")
                 
-                if session.output_queue:
-                    error_msg = f"Transport error: {e}"
-                    session.output_queue.put(('error', error_msg))
-                    MCPLogger.log(TOOL_LOG_NAME, f"QUEUE PUT session={session_id} type=error msg={error_msg[:50]} qsize={session.output_queue.qsize()}")
-                break
+                # Close the broken transport
+                if session.transport:
+                    try:
+                        session.transport.close()
+                    except:
+                        pass
+                    session.transport = None
+                
+                if auto_reconnect and session.connection_params:
+                    # Phase 5L: Enter reconnect mode
+                    session.reconnect_state.mark_disconnected(error_type, error_msg)
+                    
+                    # Mark session as temporarily inactive
+                    with session.metadata_lock:
+                        session.metadata.is_active = False
+                    
+                    # Notify AI via output_queue (once per disconnect)
+                    if session.output_queue:
+                        reconnect_msg = f"[AUTO_RECONNECT] {error_type}: {error_msg} - attempting to reconnect..."
+                        session.output_queue.put(('reconnect_start', reconnect_msg))
+                        MCPLogger.log(TOOL_LOG_NAME, f"QUEUE PUT session={session_id} type=reconnect_start")
+                    
+                    # Log to session log file
+                    if session.log_file_handle:
+                        log_entry = f"\n[{datetime.now().isoformat()}] CONNECTION LOST: {error_msg} - auto-reconnect enabled\n".encode()
+                        session.log_file_handle.write(log_entry)
+                        session.log_file_handle.flush()
+                    
+                    # Continue main loop - will enter reconnect at top
+                    continue
+                else:
+                    # No auto-reconnect, exit as before
+                    with session.metadata_lock:
+                        session.metadata.is_active = False
+                    
+                    if session.output_queue:
+                        session.output_queue.put(('error', error_msg))
+                        MCPLogger.log(TOOL_LOG_NAME, f"QUEUE PUT session={session_id} type=error msg={error_msg[:50]} qsize={session.output_queue.qsize()}")
+                    break
             
             except Exception as e:
                 MCPLogger.log(TOOL_LOG_NAME, f"Unexpected error in worker thread for session {session_id}: {e}")
@@ -5052,6 +5287,120 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
             close_log_file(session)
         
         MCPLogger.log(TOOL_LOG_NAME, f"Worker thread cleanup complete for session {session_id}")
+
+
+def _worker_attempt_reconnect(session: session_container_with_log_file, session_id: str, 
+                               stop_event: threading.Event, interval_ms: int) -> bool:
+    """
+    Phase 5L: Attempt to reconnect transport in worker thread.
+    
+    This runs in a loop until:
+    - Reconnection succeeds (returns True)
+    - stop_event is set (returns False)
+    
+    Features:
+    - Rate-limited logging to avoid spam
+    - Port availability checking for serial
+    - State tracking for status reporting
+    
+    Args:
+        session: Session container
+        session_id: Session ID for logging
+        stop_event: Event to signal stop
+        interval_ms: Retry interval in milliseconds
+        
+    Returns:
+        True if reconnected successfully, False if stopped
+    """
+    interval_seconds = interval_ms / 1000.0
+    transport_type = session.connection_params.get("transport_type", "unknown")
+    
+    MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} entering reconnect loop (interval={interval_ms}ms, type={transport_type})")
+    
+    while not stop_event.is_set():
+        try:
+            # For serial ports, check if port exists first
+            if transport_type == "serial":
+                port = session.connection_params.get("port")
+                if not is_serial_port_available(port):
+                    # Port doesn't exist - update state and wait
+                    if session.reconnect_state.connection_state != "port_missing":
+                        session.reconnect_state.mark_port_missing()
+                        MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} port {port} not available (unplugged?)")
+                        
+                        # Notify AI
+                        if session.output_queue:
+                            session.output_queue.put(('port_missing', f"Port {port} not found - waiting for device..."))
+                        
+                        # Log to file
+                        if session.log_file_handle:
+                            log_entry = f"\n[{datetime.now().isoformat()}] PORT MISSING: {port} not available\n".encode()
+                            session.log_file_handle.write(log_entry)
+                            session.log_file_handle.flush()
+                    
+                    # Wait and retry
+                    time.sleep(interval_seconds)
+                    continue
+            
+            # Attempt to create new transport
+            session.reconnect_state.connection_state = "reconnecting"
+            new_transport = create_transport_from_params(session.connection_params)
+            
+            if new_transport and new_transport.is_open():
+                # Success!
+                session.transport = new_transport
+                session.reconnect_state.mark_connected()
+                
+                # Mark session as active again
+                with session.metadata_lock:
+                    session.metadata.is_active = True
+                
+                MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} RECONNECTED successfully (attempts={session.reconnect_state.reconnect_attempts})")
+                
+                # Notify AI
+                if session.output_queue:
+                    msg = f"[AUTO_RECONNECT] Connection restored after {session.reconnect_state.reconnect_attempts} attempts"
+                    session.output_queue.put(('reconnect_success', msg))
+                
+                # Log to file
+                if session.log_file_handle:
+                    log_entry = f"\n[{datetime.now().isoformat()}] CONNECTION RESTORED\n".encode()
+                    session.log_file_handle.write(log_entry)
+                    session.log_file_handle.flush()
+                
+                return True
+            else:
+                # Transport created but not open - shouldn't happen, but handle it
+                if new_transport:
+                    try:
+                        new_transport.close()
+                    except:
+                        pass
+                raise TransportConnectionError("Transport created but not open")
+                
+        except (TransportConnectionError, TransportError) as e:
+            # Connection failed - rate-limited logging
+            error_msg = str(e)
+            should_log, log_msg = session.reconnect_state.should_log_error("reconnect_failed", error_msg)
+            if should_log:
+                MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} reconnect failed: {log_msg}")
+            
+            session.reconnect_state.reconnect_attempts += 1
+            
+        except Exception as e:
+            # Unexpected error during reconnect
+            should_log, log_msg = session.reconnect_state.should_log_error("reconnect_error", str(e))
+            if should_log:
+                MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} unexpected reconnect error: {log_msg}")
+            
+            session.reconnect_state.reconnect_attempts += 1
+        
+        # Wait before next attempt
+        time.sleep(interval_seconds)
+    
+    # Stopped by stop_event
+    MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} reconnect loop stopped by stop_event")
+    return False
 
 def _process_worker_command(session: session_container_with_log_file, cmd: tuple, session_id: str):
     """
@@ -5517,6 +5866,120 @@ def get_session(session_id: str) -> Optional[session_container_with_log_file]:
     with _session_cache_lock:
         return _active_sessions_cache.get(session_id)
 
+
+def is_serial_port_available(port_name: str) -> bool:
+    """Check if a serial port exists (without opening it).
+    
+    Phase 5L: Used by auto-reconnect to detect when USB device is plugged back in.
+    
+    Args:
+        port_name: Port name (e.g., "COM22", "/dev/ttyUSB0")
+        
+    Returns:
+        True if port exists in system port list
+    """
+    try:
+        serial, list_ports = ensure_pyserial()
+        available = [p.device for p in list_ports.comports()]
+        # Case-insensitive check for Windows (COM22 vs com22)
+        port_upper = port_name.upper()
+        return port_name in available or port_upper in [p.upper() for p in available]
+    except Exception:
+        return False
+
+
+def create_transport_from_params(connection_params: Dict) -> Optional[BaseTransport]:
+    """Create a transport instance from saved connection parameters.
+    
+    Phase 5L: Used by auto-reconnect to recreate transport after disconnect.
+    
+    Args:
+        connection_params: Dict with transport_type and type-specific params
+        
+    Returns:
+        BaseTransport instance, or None if creation fails
+        
+    Raises:
+        TransportConnectionError: If connection fails
+        TransportError: If transport creation fails
+    """
+    transport_type = connection_params.get("transport_type")
+    
+    if transport_type == "serial":
+        port = connection_params.get("port")
+        
+        # Check if port exists first (for nicer error messages)
+        if not is_serial_port_available(port):
+            raise TransportConnectionError(f"Serial port {port} not available (device unplugged?)")
+        
+        serial_port = open_serial_port_with_dtr_rts_workaround(
+            endpoint=port,
+            baud_rate=connection_params.get("baud_rate", 115200),
+            set_dtr=connection_params.get("set_dtr", False),
+            set_rts=connection_params.get("set_rts", False),
+            hardware_flow_control=connection_params.get("hardware_flow_control", False),
+            software_flow_control=connection_params.get("software_flow_control", False),
+            parity=connection_params.get("parity", "N"),
+            stopbits=connection_params.get("stopbits", 1),
+            bytesize=connection_params.get("bytesize", 8)
+        )
+        return SerialTransport(serial_port)
+    
+    elif transport_type == "tcp":
+        return TCPTransport(
+            connection_params["host"],
+            connection_params["port"],
+            connection_params.get("connect_timeout", 10.0)
+        )
+    
+    elif transport_type == "telnet":
+        tcp_transport = TCPTransport(
+            connection_params["host"],
+            connection_params["port"],
+            connection_params.get("connect_timeout", 10.0)
+        )
+        return TelnetTransport(tcp_transport, raw_mode=False)
+    
+    elif transport_type == "rfc2217":
+        tcp_transport = TCPTransport(
+            connection_params["host"],
+            connection_params["port"],
+            connection_params.get("connect_timeout", 10.0)
+        )
+        transport = RFC2217Transport(tcp_transport)
+        if connection_params.get("rfc2217_baud", 115200) != 115200:
+            transport.set_baud_rate(connection_params["rfc2217_baud"])
+        return transport
+    
+    elif transport_type == "websocket":
+        return WebSocketTransport(
+            url=connection_params["url"],
+            timeout=connection_params.get("connect_timeout", 10.0),
+            headers=connection_params.get("ws_headers", {}),
+            ws_mode=connection_params.get("ws_mode", "auto")
+        )
+    
+    elif transport_type == "bluetooth":
+        return BluetoothTransport(
+            address=connection_params["address"],
+            port=connection_params.get("bt_port", 1),
+            pin=connection_params.get("bt_pin"),
+            timeout=connection_params.get("connect_timeout", 10.0)
+        )
+    
+    elif transport_type == "ble":
+        return BLETransport(
+            address=connection_params["address"],
+            timeout=connection_params.get("connect_timeout", 10.0),
+            ble_mode=connection_params.get("ble_mode", "uart")
+        )
+    
+    # SSH and program transports are not suitable for auto-reconnect
+    # (credentials/state issues)
+    else:
+        raise TransportError(f"Transport type {transport_type} does not support auto-reconnect")
+
+
 def close_session(session_id: str) -> Tuple[bool, str]:
     """
     Close a session and clean up resources.
@@ -5602,7 +6065,7 @@ def list_active_sessions() -> List[Dict]:
 
 TOOLS = [
     {
-        "name": "terminal",
+        "name": TOOL_NAME,
         "description": """Use this to connect a persistant PuTTY-like terminalvia serial-port, telnet, tcp, sockets, pipes/FIFOs, websockets, Bluetooth, RFC2217, SSH, JTAG, or STDIO to local or remote devices, systems, services, and locally-spawned programs.""",
         "parameters": {
             "properties": {
@@ -5618,7 +6081,7 @@ TOOLS = [
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["readme", "list_ports", "discover_network", "discover_bluetooth", "discover_ble", "bleak", "bleak_get_notifications", "bleak_disconnect", "open_session", "close_session", "list_sessions", "get_session_info", "send_data", "read_data", "wait_for_pattern", "send_async", "get_async_status", "cancel_async", "set_baud", "send_break", "get_line_states", "send_sequence", "get_sequence_status", "cancel_sequence", "set_terminal_emulation"],
+                    "enum": ["readme", "list_ports", "discover_network", "discover_bluetooth", "discover_ble", "bleak", "bleak_get_notifications", "bleak_disconnect", "open_session", "close_session", "list_sessions", "get_session_info", "send_data", "read_data", "wait_for_pattern", "send_async", "get_async_status", "cancel_async", "set_baud", "send_break", "get_line_states", "send_sequence", "get_sequence_status", "cancel_sequence", "set_terminal_emulation", "enable_bluetooth"],
                     "description": "Operation to perform"
                 },
                 "session_id": {
@@ -5764,6 +6227,16 @@ TOOLS = [
                     "default": 5.0,
                     "description": "Connection establishment timeout in seconds (all network/IPC transports)"
                 },
+                "auto_reconnect": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Enable auto-reconnect mode: session stays alive and retries connection on disconnect (great for capturing boot logs from devices that reset, or handling flaky network connections)"
+                },
+                "auto_reconnect_interval_ms": {
+                    "type": "integer",
+                    "default": 500,
+                    "description": "Auto-reconnect retry interval in milliseconds (default 500ms). Only used when auto_reconnect is true."
+                },
                 "ssh_username": {
                     "type": "string",
                     "description": "Username for SSH authentication (can also be in endpoint as ssh://user@host:port)"
@@ -5907,6 +6380,12 @@ TOOLS = [
                     "type": "object",
                     "description": "Optional HTTP headers for WebSocket handshake (dict of header_name: header_value pairs, e.g., {'Authorization': 'Bearer token123'})"
                 },
+                "ws_mode": {
+                    "type": "string",
+                    "default": "auto",
+                    "enum": ["auto", "text", "binary"],
+                    "description": "WebSocket frame mode: 'auto' (detect JSON, send as text), 'text' (always text frames for JSON-RPC/CDP), 'binary' (always binary frames)"
+                },
                 "bt_port": {
                     "type": "number",
                     "default": 1,
@@ -5951,6 +6430,9 @@ For communicating with microcontrollers, and/or other devices and systems.
   * Custom HTTP headers for authentication
   * Auto-installs websocket-client library if missing
   * Automatic ping/pong keepalive
+  * **Smart frame mode**: Auto-detect JSON and send as text frames (perfect for CDP, JSON-RPC)
+  * **Frame modes**: `auto` (default, detect JSON), `text` (always text), `binary` (always binary)
+  * **Use cases**: Chrome DevTools Protocol debugging, JSON-RPC APIs, IoT web consoles
 
 ### RFC2217 Transport (Remote Serial Port Control)
   * `rfc2217://host:port` endpoint format (e.g., `rfc2217://192.168.1.100:2217`)
@@ -6300,6 +6782,15 @@ Parameters:
 **TCP-specific parameters** (ignored for serial):
 - connect_timeout (optional): Connection timeout in seconds (default 5.0)
 
+**Auto-reconnect parameters** (Phase 5L - works with serial, TCP, telnet, websocket, bluetooth, BLE):
+- auto_reconnect (optional): Enable persistent connection mode (default False)
+  * When enabled, session stays alive on disconnect and retries connection automatically
+  * Perfect for: ESP32/MCU that resets (capture boot logs!), flaky USB connections, ephemeral device ports, network hiccups
+  * The session log file captures ALL data including reconnection events
+- auto_reconnect_interval_ms (optional): Retry interval in milliseconds (default 500)
+  * Faster = more responsive but higher CPU, slower = gentler on system
+  * For serial ports, also checks if port exists before attempting connection
+
 Returns: session_id, log_file_path, transport_type, and connection status
 
 **SSH-specific parameters** (ignored for serial/TCP/Telnet):
@@ -6329,6 +6820,27 @@ Returns: session_id, log_file_path, transport_type, and connection status
 
 // TCP connection (raw bytes, no IAC)
 {"operation": "open_session", "endpoint": "tcp://192.168.1.103:23", "connect_timeout": 10.0, "tool_unlock_token": "..."}
+
+// WebSocket connection with auto-detect mode (default - detects JSON automatically)
+{"operation": "open_session", "endpoint": "ws://127.0.0.1:9222/devtools/page/ABC123", "tool_unlock_token": "..."}
+
+// WebSocket with explicit text mode (for JSON-RPC, CDP, text APIs)
+{"operation": "open_session", "endpoint": "ws://api.example.com/rpc", "ws_mode": "text", "tool_unlock_token": "..."}
+
+// WebSocket with binary mode (for raw binary protocols)
+{"operation": "open_session", "endpoint": "ws://device.local/binary", "ws_mode": "binary", "tool_unlock_token": "..."}
+
+// WebSocket with custom headers (authentication)
+{"operation": "open_session", "endpoint": "ws://api.example.com/ws", "ws_headers": {"Authorization": "Bearer token123"}, "tool_unlock_token": "..."}
+
+// Auto-reconnect enabled for ESP32 that resets (Phase 5L - captures boot logs!)
+{"operation": "open_session", "endpoint": "COM22", "baud_rate": 115200, "auto_reconnect": true, "tool_unlock_token": "..."}
+
+// Auto-reconnect with faster retry for time-critical boot log capture
+{"operation": "open_session", "endpoint": "COM22", "auto_reconnect": true, "auto_reconnect_interval_ms": 100, "tool_unlock_token": "..."}
+
+// Auto-reconnect for flaky network connection
+{"operation": "open_session", "endpoint": "tcp://192.168.1.50:23", "auto_reconnect": true, "tool_unlock_token": "..."}
 ```
 
 ### send_data
@@ -6943,6 +7455,10 @@ def handle_open_session(params: Dict) -> Dict:
         ssh_otp_code = params.get("ssh_otp_code")      # Phase 5C-4: Pre-generated OTP
         ssh_allow_agent = params.get("ssh_allow_agent", False)  # Phase 5C-4: SSH agent (OUT OF SCOPE)
         
+        # Phase 5L: Auto-reconnect parameters
+        auto_reconnect = params.get("auto_reconnect", False)
+        auto_reconnect_interval_ms = params.get("auto_reconnect_interval_ms", 500)
+        
         if not endpoint:
             return create_error_response("Parameter 'endpoint' is required for open_session", with_readme=False)
         
@@ -6968,6 +7484,30 @@ def handle_open_session(params: Dict) -> Dict:
         # Create session (Phase 1 infrastructure)
         session_id = create_new_session(endpoint, transport_type)
         session = get_session(session_id)
+        
+        # Phase 5L: Store auto_reconnect settings in metadata
+        session.metadata.auto_reconnect_enabled = auto_reconnect
+        session.metadata.auto_reconnect_interval_ms = auto_reconnect_interval_ms
+        
+        # Phase 5L: Store connection_params BEFORE attempting transport creation
+        # This is needed so the worker thread can reconnect if initial connection fails
+        if transport_type == "serial":
+            session.connection_params = {
+                "transport_type": "serial",
+                "port": connection_params["port"],
+                "baud_rate": baud_rate,
+                "set_dtr": set_dtr,
+                "set_rts": set_rts,
+                "hardware_flow_control": hardware_flow_control,
+                "software_flow_control": software_flow_control,
+                "parity": parity,
+                "stopbits": stopbits,
+                "bytesize": bytesize,
+            }
+        
+        # Phase 5L: Track if initial connection failed (for auto_reconnect mode)
+        initial_connection_failed = False
+        initial_connection_error = None
         
         # Phase 5A2: Create transport based on endpoint type
         try:
@@ -6999,6 +7539,14 @@ def handle_open_session(params: Dict) -> Dict:
                 host = connection_params["host"]
                 port = connection_params["port"]
                 
+                # Phase 5L: Store connection params BEFORE attempting connection
+                session.connection_params = {
+                    "transport_type": "tcp",
+                    "host": host,
+                    "port": port,
+                    "connect_timeout": connect_timeout,
+                }
+                
                 MCPLogger.log(TOOL_LOG_NAME, f"Opening TCP connection: {host}:{port} (timeout: {connect_timeout}s)")
                 
                 # Create TCP transport (connection happens in __init__)
@@ -7010,6 +7558,14 @@ def handle_open_session(params: Dict) -> Dict:
                 # Telnet transport: TCP + IAC protocol handling (Phase 5B)
                 host = connection_params["host"]
                 port = connection_params["port"]
+                
+                # Phase 5L: Store connection params BEFORE attempting connection
+                session.connection_params = {
+                    "transport_type": "telnet",
+                    "host": host,
+                    "port": port,
+                    "connect_timeout": connect_timeout,
+                }
                 
                 MCPLogger.log(TOOL_LOG_NAME, f"Opening Telnet connection: {host}:{port} (timeout: {connect_timeout}s)")
                 
@@ -7028,6 +7584,15 @@ def handle_open_session(params: Dict) -> Dict:
                 
                 # RFC2217-specific parameters
                 rfc2217_baud = params.get("rfc2217_baud", 115200)
+                
+                # Phase 5L: Store connection params BEFORE attempting connection
+                session.connection_params = {
+                    "transport_type": "rfc2217",
+                    "host": host,
+                    "port": port,
+                    "connect_timeout": connect_timeout,
+                    "rfc2217_baud": rfc2217_baud,
+                }
                 
                 MCPLogger.log(TOOL_LOG_NAME, f"Opening RFC2217 connection: {host}:{port} (timeout: {connect_timeout}s, baud: {rfc2217_baud})")
                 
@@ -7148,14 +7713,25 @@ def handle_open_session(params: Dict) -> Dict:
                 
                 # WebSocket-specific parameters
                 ws_headers = params.get("ws_headers", {})  # Optional HTTP headers for handshake
+                ws_mode = params.get("ws_mode", connection_params.get("ws_mode", "auto"))  # Frame mode: auto/text/binary
                 
-                MCPLogger.log(TOOL_LOG_NAME, f"Opening WebSocket connection: {url} (timeout: {connect_timeout}s)")
+                MCPLogger.log(TOOL_LOG_NAME, f"Opening WebSocket connection: {url} (timeout: {connect_timeout}s, mode: {ws_mode})")
+                
+                # Phase 5L: Store connection params BEFORE attempting connection
+                session.connection_params = {
+                    "transport_type": "websocket",
+                    "url": url,
+                    "connect_timeout": connect_timeout,
+                    "ws_headers": ws_headers,
+                    "ws_mode": ws_mode,
+                }
                 
                 # Create WebSocket transport (connection happens in __init__)
                 session.transport = WebSocketTransport(
                     url=url,
                     timeout=connect_timeout,
-                    headers=ws_headers
+                    headers=ws_headers,
+                    ws_mode=ws_mode
                 )
                 
                 MCPLogger.log(TOOL_LOG_NAME, f"WebSocket transport created successfully for {url}")
@@ -7167,6 +7743,15 @@ def handle_open_session(params: Dict) -> Dict:
                 # Bluetooth-specific parameters
                 bt_port = params.get("bt_port", 1)  # RFCOMM channel (default 1 for SPP)
                 bt_pin = params.get("bt_pin", None)  # Optional PIN for pairing
+                
+                # Phase 5L: Store connection params BEFORE attempting connection
+                session.connection_params = {
+                    "transport_type": "bluetooth",
+                    "address": address,
+                    "bt_port": bt_port,
+                    "bt_pin": bt_pin,
+                    "connect_timeout": connect_timeout,
+                }
                 
                 MCPLogger.log(TOOL_LOG_NAME, f"Opening Classic Bluetooth connection: {address}:{bt_port} (timeout: {connect_timeout}s)")
                 
@@ -7186,6 +7771,14 @@ def handle_open_session(params: Dict) -> Dict:
                 
                 # BLE-specific parameters
                 ble_mode = params.get("ble_mode", "uart")  # "uart" or "generic"
+                
+                # Phase 5L: Store connection params BEFORE attempting connection
+                session.connection_params = {
+                    "transport_type": "ble",
+                    "address": address,
+                    "connect_timeout": connect_timeout,
+                    "ble_mode": ble_mode,
+                }
                 
                 MCPLogger.log(TOOL_LOG_NAME, f"Opening BLE connection: {address} (mode: {ble_mode}, timeout: {connect_timeout}s)")
                 
@@ -7227,6 +7820,11 @@ def handle_open_session(params: Dict) -> Dict:
                 "transport_type": transport_type,
                 "log_file_path": str(session.metadata.log_file_path),
             }
+            
+            # Phase 5L: Include auto_reconnect in result if enabled
+            if auto_reconnect:
+                result["auto_reconnect"] = True
+                result["auto_reconnect_interval_ms"] = auto_reconnect_interval_ms
             
             if transport_type == "serial":
                 # Add serial-specific info
@@ -7355,15 +7953,64 @@ def handle_open_session(params: Dict) -> Dict:
                 "isError": False
             }
             
-        except TransportConnectionError as e:
-            # Phase 5A2: Transport connection failed - clean up session
-            close_session(session_id)
-            raise Exception(f"Failed to connect to {endpoint}: {str(e)}")
-        
-        except Exception as e:
-            # Other errors during transport creation - clean up session
-            close_session(session_id)
-            raise Exception(f"Failed to open transport for {endpoint}: {str(e)}")
+        except (TransportConnectionError, Exception) as e:
+            # Phase 5L: If auto_reconnect is enabled, don't fail - start session in reconnect mode
+            if auto_reconnect and session.connection_params:
+                initial_connection_failed = True
+                initial_connection_error = str(e)
+                MCPLogger.log(TOOL_LOG_NAME, f"Initial connection to {endpoint} failed ({initial_connection_error}), but auto_reconnect enabled - starting in reconnect mode")
+                
+                # Mark the reconnect state
+                session.reconnect_state.mark_disconnected("initial_connection_failed", initial_connection_error)
+                session.reconnect_state.connection_state = "port_missing" if "FileNotFoundError" in initial_connection_error or "cannot find" in initial_connection_error.lower() else "reconnecting"
+                
+                # Mark session as not yet active (will become active when connected)
+                with session.metadata_lock:
+                    session.metadata.is_active = False
+                
+                # Set up queues for worker thread
+                session.command_queue = queue.Queue()
+                session.response_queue = queue.Queue()
+                session.output_queue = queue.Queue()
+                MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} created in reconnect mode: output_queue_id={id(session.output_queue)}")
+                
+                # Start worker thread (will immediately enter reconnect loop)
+                session.worker_stop_event = threading.Event()
+                session.worker_thread = threading.Thread(
+                    target=serial_port_worker_thread,
+                    args=(session_id, session.worker_stop_event),
+                    daemon=True,
+                    name=f"MCU_Serial_Worker_{session_id}"
+                )
+                session.worker_thread.start()
+                
+                MCPLogger.log(TOOL_LOG_NAME, f"Worker thread started for session {session_id} in auto_reconnect mode - waiting for {endpoint}")
+                
+                # Build result for auto_reconnect mode
+                result = {
+                    "success": True,
+                    "session_id": session_id,
+                    "endpoint": endpoint,
+                    "transport_type": transport_type,
+                    "log_file_path": str(session.metadata.log_file_path),
+                    "auto_reconnect": True,
+                    "auto_reconnect_interval_ms": auto_reconnect_interval_ms,
+                    "connection_state": session.reconnect_state.connection_state,
+                    "initial_connection_error": initial_connection_error,
+                    "message": f"Session {session_id} created in auto-reconnect mode. Waiting for {endpoint} to become available..."
+                }
+                
+                return {
+                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                    "isError": False
+                }
+            else:
+                # No auto_reconnect - fail as before
+                close_session(session_id)
+                if isinstance(e, TransportConnectionError):
+                    raise Exception(f"Failed to connect to {endpoint}: {str(e)}")
+                else:
+                    raise Exception(f"Failed to open transport for {endpoint}: {str(e)}")
         
     except Exception as e:
         return create_error_response(f"Error opening session: {str(e)}", with_readme=False)
@@ -7474,6 +8121,16 @@ def handle_get_session_info(params: Dict) -> Dict:
                 "is_active": session.metadata.is_active,
                 "worker_thread_alive": worker_thread_alive  # Phase 2B
             }
+            
+            # Phase 5L: Include auto_reconnect status if enabled
+            if session.metadata.auto_reconnect_enabled:
+                result["auto_reconnect"] = {
+                    "enabled": True,
+                    "interval_ms": session.metadata.auto_reconnect_interval_ms,
+                }
+                # Include reconnect state details
+                if session.reconnect_state:
+                    result["auto_reconnect"].update(session.reconnect_state.get_status_dict())
         
         return {
             "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
@@ -7704,7 +8361,31 @@ def handle_discover_ble(params: Dict) -> Dict:
         asyncio.set_event_loop(loop)
         
         try:
-            devices = loop.run_until_complete(_async_discover_ble(duration, include_services))
+            try:
+                devices = loop.run_until_complete(_async_discover_ble(duration, include_services))
+            except Exception as e:
+                # Auto-enable logic for Windows "Device not ready" error (WinError -2147020577)
+                # This happens when the Bluetooth radio is soft-disabled in Settings
+                error_str = str(e)
+                if "WinError -2147020577" in error_str or "device is not ready" in error_str.lower():
+                    MCPLogger.log(TOOL_LOG_NAME, "Bluetooth appears disabled. Attempting auto-enable...")
+                    
+                    # Try to enable using our new handler
+                    # Note: This uses winsdk if available, or fails gracefully
+                    enable_result = handle_enable_bluetooth({"enabled": True})
+                    
+                    if not enable_result.get("isError"):
+                        MCPLogger.log(TOOL_LOG_NAME, f"Bluetooth auto-enable result: {enable_result['content'][0]['text']}. Retrying discovery...")
+                        # Give the radio a moment to wake up
+                        import time
+                        time.sleep(2.0)
+                        # Retry once
+                        devices = loop.run_until_complete(_async_discover_ble(duration, include_services))
+                    else:
+                        MCPLogger.log(TOOL_LOG_NAME, f"Auto-enable failed: {enable_result['content'][0]['text']}")
+                        raise e
+                else:
+                    raise e
         finally:
             loop.close()
         
@@ -7739,18 +8420,76 @@ async def _async_discover_ble(duration: float, include_services: bool):
     """Async BLE discovery helper."""
     import bleak
     
+    def _serialize_ble_object(obj):
+        """Helper to serialize Bleak objects dynamically to ensure future properties are included."""
+        result = {}
+        # Iterate over all attributes to catch future fields automatically
+        for attr_name in dir(obj):
+            if attr_name.startswith("_"):
+                continue
+            
+            try:
+                val = getattr(obj, attr_name)
+            except Exception:
+                continue
+                
+            if callable(val):
+                continue
+                
+            # Skip huge/non-serializable platform objects
+            if attr_name in ["details", "platform_data"]:
+                continue
+                
+            # Handle data types
+            if isinstance(val, (bytes, bytearray)):
+                result[attr_name] = val.hex()
+            elif isinstance(val, dict):
+                # Handle dictionaries (e.g. manufacturer_data, service_data)
+                new_dict = {}
+                for k, v in val.items():
+                    key_str = str(k)
+                    if isinstance(v, (bytes, bytearray)):
+                        new_dict[key_str] = v.hex()
+                    else:
+                        new_dict[key_str] = str(v)
+                result[attr_name] = new_dict
+            elif isinstance(val, (list, tuple, set)):
+                # Handle lists (e.g. service_uuids)
+                new_list = []
+                for item in val:
+                    if isinstance(item, (bytes, bytearray)):
+                        new_list.append(item.hex())
+                    else:
+                        new_list.append(str(item))
+                result[attr_name] = new_list
+            else:
+                # Default to string representation for UUIDs and unknown types, keep primitives
+                if type(val) in (str, int, float, bool, type(None)):
+                    result[attr_name] = val
+                else:
+                    result[attr_name] = str(val)
+                    
+        return result
+
     devices = []
     
-    # Scan for devices
+    # Scan for devices with advertisement data (required for RSSI in newer bleak versions)
     scanner = bleak.BleakScanner()
-    discovered = await scanner.discover(timeout=duration)
+    # return_adv=True returns a dict: {address: (device, advertisement_data)}
+    discovered = await scanner.discover(timeout=duration, return_adv=True)
     
-    for device in discovered:
-        device_info = {
-            "address": device.address,
-            "name": device.name if device.name else "(unknown)",
-            "rssi": device.rssi,
-        }
+    for address, (device, adv_data) in discovered.items():
+        # Dynamically serialize both objects and merge them
+        # This ensures any new fields in Bleak/BlueZ/Windows are automatically surfaced
+        device_info = _serialize_ble_object(device)
+        adv_info = _serialize_ble_object(adv_data)
+        
+        # Merge advertisement data into device info (adv data takes precedence for duplicates like RSSI)
+        device_info.update(adv_info)
+        
+        # Ensure essential fields exist even if serialization behaved oddly
+        if "address" not in device_info: device_info["address"] = device.address
+        if "name" not in device_info: device_info["name"] = device.name or "(unknown)"
         
         # If requested, connect and discover services/characteristics
         if include_services:
@@ -7760,14 +8499,14 @@ async def _async_discover_ble(duration: float, include_services: bool):
                     
                     for service in client.services:
                         service_info = {
-                            "uuid": service.uuid,
+                            "uuid": str(service.uuid),
                             "description": service.description if hasattr(service, 'description') else "(unknown)",
                             "characteristics": []
                         }
                         
                         for char in service.characteristics:
                             char_info = {
-                                "uuid": char.uuid,
+                                "uuid": str(char.uuid),
                                 "description": char.description if hasattr(char, 'description') else "(unknown)",
                                 "properties": char.properties
                             }
@@ -8603,6 +9342,61 @@ def handle_set_terminal_emulation(params: Dict) -> Dict:
     except Exception as e:
         return create_error_response(f"Error in set_terminal_emulation: {str(e)}", with_readme=False)
 
+def handle_enable_bluetooth(params: Dict) -> Dict:
+    """Enable/Disable Bluetooth adapter on Windows using native winsdk."""
+    import sys
+    
+    if sys.platform != "win32":
+        return create_error_response("enable_bluetooth is only supported on Windows", with_readme=False)
+        
+    enabled = params.get("enabled", True)
+    
+    try:
+        # Try to import winsdk (Phase 5K: Native Windows integration)
+        import winsdk.windows.devices.radios as radios
+        import asyncio
+        
+        async def _toggle_bt():
+            # Request radio access
+            access = await radios.Radio.request_access_async()
+            if access != radios.RadioAccessStatus.ALLOWED:
+                return "Access Denied"
+                
+            # Find Bluetooth radio
+            all_radios = await radios.Radio.get_radios_async()
+            bt_radio = next((r for r in all_radios if r.kind == radios.RadioKind.BLUETOOTH), None)
+            
+            if not bt_radio:
+                return "No Bluetooth Radio Found"
+                
+            target_state = radios.RadioState.ON if enabled else radios.RadioState.OFF
+            
+            # Check current state
+            if bt_radio.state != target_state:
+                await bt_radio.set_state_async(target_state)
+                return "Enabled" if enabled else "Disabled"
+            else:
+                return "Already On" if enabled else "Already Off"
+
+        # Run async code in sync context
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            status = loop.run_until_complete(_toggle_bt())
+        finally:
+            loop.close()
+            
+        return {
+            "content": [{"type": "text", "text": f"Bluetooth Status: {status}"}],
+            "isError": False
+        }
+
+    except ImportError:
+        # Fallback to PowerShell if winsdk is missing (legacy support)
+        return create_error_response("winsdk package not found. Please pip install winsdk.", with_readme=False)
+    except Exception as e:
+        return create_error_response(f"Error toggling Bluetooth: {str(e)}", with_readme=False)
+
 # ============================================================================
 # MAIN HANDLER
 # ============================================================================
@@ -8695,6 +9489,8 @@ def handle_terminal(input_param: Dict) -> Dict:
             return handle_cancel_sequence(validated_params)
         elif operation == "set_terminal_emulation":
             return handle_set_terminal_emulation(validated_params)
+        elif operation == "enable_bluetooth":
+            return handle_enable_bluetooth(validated_params)
         
         elif operation == "readme":
             return {
@@ -8713,6 +9509,6 @@ def handle_terminal(input_param: Dict) -> Dict:
 # ============================================================================
 
 HANDLERS = {
-    "terminal": handle_terminal
+    TOOL_NAME: handle_terminal
 }
 
