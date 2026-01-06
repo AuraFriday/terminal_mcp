@@ -79,6 +79,7 @@ Terminal_mcp isn't just "run this command." It's:
 - **Pattern matching** - AI waits for specific responses before proceeding
 - **Smart sequencing** - Multi-step operations execute atomically
 - **Persistent auto-reconnect** - Sessions survive device resets, unplugs, reboots - never miss a boot log
+- **SFTP file transfer** - Upload/download files over SSH without interrupting your shell
 - **Error recovery** - Connection drops don't lose data
 - **Automatic logging** - Everything captured for debugging and audit
 - **Progress tracking** - Long operations report status
@@ -131,6 +132,19 @@ Terminal_mcp isn't just "run this command." It's:
 - *Crash loop? It captures every single boot.*
 
 *I tested it - 5 reconnects through unplugs, resets, and DFU transitions. Captured 31KB of boot logs. Zero manual intervention. My AI can finally debug crashes that happen when I'm not watching."*
+
+### **DevOps Engineer: "Deployments Are Actually One Command Now"**
+
+*"I used to juggle three tools: SSH for commands, SCP for file transfers, and a browser for monitoring. Every deployment was a context-switching nightmare.*
+
+*Now I tell my AI 'deploy v2.4 to production' and it:*
+- *SSH into each server*
+- *Uploads the new binary via SFTP (same session!)*
+- *Runs the deployment script*
+- *Downloads the logs to verify*
+- *All without me opening a single terminal*
+
+*The SFTP just works - it uses the existing SSH connection, so no extra authentication. Worked perfectly the first time I tried it."*
 
 ### **Security Researcher: "Reverse Engineering Is Actually Fun Now"**
 
@@ -288,6 +302,7 @@ The science fiction future isn't coming.
 - Execute maintenance scripts
 - Monitor logs
 - Manage services
+- **Transfer files via SFTP** (upload firmware, download logs - without interrupting your shell session!)
 
 ### **Bluetooth Devices**
 - Read fitness tracker data
@@ -451,6 +466,80 @@ With auto-reconnect, your AI can:
 - Run unattended overnight and have complete logs in the morning
 
 **Your AI finally has the same persistence you do.** It doesn't give up when the device hiccups. It waits, reconnects, and continues the job.
+
+---
+
+## 📁 SFTP File Transfer: Move Files Without Leaving Your Session
+
+**SSH sessions now include full SFTP support.**
+
+### The Problem Before
+
+You're debugging a remote server via SSH. You need to:
+- Upload a new binary
+- Download some logs
+- Check what files are in a directory
+
+**Before:** Open a separate SFTP client, enter credentials again, navigate to the right folder, transfer, switch back to your terminal...
+
+**After:** Just ask your AI. It uses the same SSH session.
+
+### How It Works
+
+Terminal_mcp opens a **separate SFTP channel** over your existing SSH connection. This means:
+
+- ✅ **No new authentication** - uses your existing session
+- ✅ **Shell stays active** - file transfers don't interrupt your terminal
+- ✅ **Progress tracking** - see bytes transferred, speed, elapsed time
+- ✅ **Bidirectional** - upload AND download
+
+### Available Operations
+
+```json
+// Upload firmware to remote server
+{
+  "operation": "sftp_put",
+  "session_id": "ssh_1",
+  "local_path": "C:/builds/firmware-v2.3.bin",
+  "remote_path": "/home/deploy/firmware/app.bin"
+}
+
+// Download logs for analysis
+{
+  "operation": "sftp_get",
+  "session_id": "ssh_1",
+  "remote_path": "/var/log/app.log",
+  "local_path": "C:/logs/remote-app.log"
+}
+
+// List remote directory
+{
+  "operation": "sftp_list",
+  "session_id": "ssh_1",
+  "remote_path": "/home/deploy/"
+}
+```
+
+### Real-World Use Cases
+
+- **Deploy binaries** to remote build servers
+- **Download crash dumps** for local analysis
+- **Upload config files** during remote setup
+- **Backup remote data** before making changes
+- **Transfer firmware** to embedded Linux devices
+- **Collect logs** from multiple servers automatically
+
+### Works Perfectly With Your Workflow
+
+Your AI can now:
+1. SSH into a server
+2. Run commands to prepare a deployment
+3. **Upload the new binary via SFTP**
+4. Run commands to restart services
+5. **Download logs via SFTP** to verify
+6. All in one session. All automated.
+
+**No context switching. No separate tools. No re-authentication.**
 
 ---
 

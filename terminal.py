@@ -2721,6 +2721,203 @@ class SSHTransport(BaseTransport):
         return self._connected and self.channel and not self.channel.closed
     
     # ========================================================================
+    # SFTP Support (Phase 5M - File Transfer)
+    # ========================================================================
+    
+    def get_sftp_client(self):
+        """Get or create SFTP client for file transfer.
+        
+        The SFTP channel is separate from the shell channel, so file transfers
+        don't interfere with interactive sessions.
+        
+        Returns:
+            paramiko.SFTPClient instance
+            
+        Raises:
+            TransportConnectionError: SSH not connected
+            TransportError: SFTP channel creation failed
+        """
+        if not self._connected or not self.ssh_client:
+            raise TransportConnectionError("SSH not connected - cannot create SFTP channel")
+        
+        try:
+            sftp = self.ssh_client.open_sftp()
+            MCPLogger.log(TOOL_LOG_NAME, "SFTP channel opened successfully")
+            return sftp
+        except Exception as e:
+            MCPLogger.log(TOOL_LOG_NAME, f"SFTP channel creation failed: {e}")
+            raise TransportError(f"Failed to open SFTP channel: {e}") from e
+    
+    def sftp_put(self, local_path: str, remote_path: str, progress_callback=None) -> dict:
+        """Upload a file to the remote server via SFTP.
+        
+        Args:
+            local_path: Path to local file
+            remote_path: Destination path on remote server
+            progress_callback: Optional callback(bytes_transferred, total_bytes)
+            
+        Returns:
+            dict with transfer stats: bytes_transferred, elapsed_seconds
+            
+        Raises:
+            TransportError: Transfer failed
+        """
+        import os
+        import time
+        
+        if not os.path.exists(local_path):
+            raise TransportError(f"Local file not found: {local_path}")
+        
+        file_size = os.path.getsize(local_path)
+        MCPLogger.log(TOOL_LOG_NAME, f"SFTP PUT: {local_path} ({file_size} bytes) -> {remote_path}")
+        
+        start_time = time.time()
+        sftp = None
+        
+        try:
+            sftp = self.get_sftp_client()
+            
+            # Paramiko's put() supports a callback for progress
+            def _progress(transferred, total):
+                if progress_callback:
+                    progress_callback(transferred, total)
+            
+            sftp.put(local_path, remote_path, callback=_progress)
+            
+            elapsed = time.time() - start_time
+            MCPLogger.log(TOOL_LOG_NAME, f"SFTP PUT complete: {file_size} bytes in {elapsed:.2f}s ({file_size/elapsed/1024:.1f} KB/s)")
+            
+            return {
+                "bytes_transferred": file_size,
+                "elapsed_seconds": elapsed,
+                "speed_kbps": file_size / elapsed / 1024 if elapsed > 0 else 0
+            }
+            
+        except Exception as e:
+            MCPLogger.log(TOOL_LOG_NAME, f"SFTP PUT failed: {e}")
+            raise TransportError(f"SFTP upload failed: {e}") from e
+        finally:
+            if sftp:
+                try:
+                    sftp.close()
+                except:
+                    pass
+    
+    def sftp_get(self, remote_path: str, local_path: str, progress_callback=None) -> dict:
+        """Download a file from the remote server via SFTP.
+        
+        Args:
+            remote_path: Path to file on remote server
+            local_path: Destination path on local machine
+            progress_callback: Optional callback(bytes_transferred, total_bytes)
+            
+        Returns:
+            dict with transfer stats: bytes_transferred, elapsed_seconds
+            
+        Raises:
+            TransportError: Transfer failed
+        """
+        import os
+        import time
+        
+        MCPLogger.log(TOOL_LOG_NAME, f"SFTP GET: {remote_path} -> {local_path}")
+        
+        start_time = time.time()
+        sftp = None
+        
+        try:
+            sftp = self.get_sftp_client()
+            
+            # Get remote file size first
+            try:
+                remote_stat = sftp.stat(remote_path)
+                file_size = remote_stat.st_size
+                MCPLogger.log(TOOL_LOG_NAME, f"SFTP GET: remote file size = {file_size} bytes")
+            except Exception as e:
+                MCPLogger.log(TOOL_LOG_NAME, f"SFTP GET: could not stat remote file: {e}")
+                file_size = None
+            
+            # Ensure local directory exists
+            local_dir = os.path.dirname(local_path)
+            if local_dir and not os.path.exists(local_dir):
+                os.makedirs(local_dir)
+                MCPLogger.log(TOOL_LOG_NAME, f"SFTP GET: created local directory {local_dir}")
+            
+            # Paramiko's get() supports a callback for progress
+            def _progress(transferred, total):
+                if progress_callback:
+                    progress_callback(transferred, total)
+            
+            sftp.get(remote_path, local_path, callback=_progress)
+            
+            # Get actual transferred size
+            transferred_size = os.path.getsize(local_path)
+            elapsed = time.time() - start_time
+            
+            MCPLogger.log(TOOL_LOG_NAME, f"SFTP GET complete: {transferred_size} bytes in {elapsed:.2f}s ({transferred_size/elapsed/1024:.1f} KB/s)")
+            
+            return {
+                "bytes_transferred": transferred_size,
+                "elapsed_seconds": elapsed,
+                "speed_kbps": transferred_size / elapsed / 1024 if elapsed > 0 else 0
+            }
+            
+        except Exception as e:
+            MCPLogger.log(TOOL_LOG_NAME, f"SFTP GET failed: {e}")
+            raise TransportError(f"SFTP download failed: {e}") from e
+        finally:
+            if sftp:
+                try:
+                    sftp.close()
+                except:
+                    pass
+    
+    def sftp_list(self, remote_path: str) -> list:
+        """List directory contents on remote server via SFTP.
+        
+        Args:
+            remote_path: Path to directory on remote server
+            
+        Returns:
+            List of dicts with file info: name, size, is_dir, mtime, mode
+            
+        Raises:
+            TransportError: Listing failed
+        """
+        import stat as stat_module
+        
+        MCPLogger.log(TOOL_LOG_NAME, f"SFTP LIST: {remote_path}")
+        
+        sftp = None
+        
+        try:
+            sftp = self.get_sftp_client()
+            
+            entries = []
+            for attr in sftp.listdir_attr(remote_path):
+                entry = {
+                    "name": attr.filename,
+                    "size": attr.st_size,
+                    "is_dir": stat_module.S_ISDIR(attr.st_mode) if attr.st_mode else False,
+                    "mtime": attr.st_mtime,
+                    "mode": oct(attr.st_mode & 0o777) if attr.st_mode else None
+                }
+                entries.append(entry)
+            
+            MCPLogger.log(TOOL_LOG_NAME, f"SFTP LIST: found {len(entries)} entries")
+            return entries
+            
+        except Exception as e:
+            MCPLogger.log(TOOL_LOG_NAME, f"SFTP LIST failed: {e}")
+            raise TransportError(f"SFTP directory listing failed: {e}") from e
+        finally:
+            if sftp:
+                try:
+                    sftp.close()
+                except:
+                    pass
+    
+    # ========================================================================
     # Serial control lines (NOT supported for SSH)
     # ========================================================================
     
@@ -6081,7 +6278,7 @@ TOOLS = [
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["readme", "list_ports", "discover_network", "discover_bluetooth", "discover_ble", "bleak", "bleak_get_notifications", "bleak_disconnect", "open_session", "close_session", "list_sessions", "get_session_info", "send_data", "read_data", "wait_for_pattern", "send_async", "get_async_status", "cancel_async", "set_baud", "send_break", "get_line_states", "send_sequence", "get_sequence_status", "cancel_sequence", "set_terminal_emulation", "enable_bluetooth"],
+                    "enum": ["readme", "list_ports", "discover_network", "discover_bluetooth", "discover_ble", "bleak", "bleak_get_notifications", "bleak_disconnect", "open_session", "close_session", "list_sessions", "get_session_info", "send_data", "read_data", "wait_for_pattern", "send_async", "get_async_status", "cancel_async", "set_baud", "send_break", "get_line_states", "send_sequence", "get_sequence_status", "cancel_sequence", "set_terminal_emulation", "enable_bluetooth", "sftp_put", "sftp_get", "sftp_list"],
                     "description": "Operation to perform"
                 },
                 "session_id": {
@@ -6146,6 +6343,14 @@ TOOLS = [
                 "file_path": {
                     "type": "string",
                     "description": "Path to file (for send_async: source file to stream; for operations reading files)"
+                },
+                "local_path": {
+                    "type": "string",
+                    "description": "Local file path (for sftp_put: source file; for sftp_get: destination file)"
+                },
+                "remote_path": {
+                    "type": "string",
+                    "description": "Remote file/directory path (for sftp_put: destination; for sftp_get: source; for sftp_list: directory to list)"
                 },
                 "operation_id": {
                     "type": "string",
@@ -7132,6 +7337,90 @@ Returns:
 - rts: Request To Send (output, current state)
 
 Use Case: Monitor hardware flow control state, debug wiring issues.
+
+### sftp_put (Phase 5M)
+Upload a file to a remote server via SFTP. Only works with SSH transport sessions.
+
+The SFTP channel is separate from the interactive shell channel, so file transfers
+don't interfere with your terminal session.
+
+Parameters:
+- session_id (required): SSH session to use
+- local_path (required): Path to local file to upload
+- remote_path (required): Destination path on remote server
+
+Returns:
+- bytes_transferred: Number of bytes uploaded
+- elapsed_seconds: Transfer time
+- speed_kbps: Transfer speed in KB/s
+
+Example:
+```json
+{
+  "operation": "sftp_put",
+  "session_id": "mcu_1",
+  "local_path": "C:/firmware/app.bin",
+  "remote_path": "/home/user/firmware/app.bin",
+  "tool_unlock_token": "..."
+}
+```
+
+### sftp_get (Phase 5M)
+Download a file from a remote server via SFTP. Only works with SSH transport sessions.
+
+Parameters:
+- session_id (required): SSH session to use
+- remote_path (required): Path to file on remote server
+- local_path (required): Destination path on local machine
+
+Returns:
+- bytes_transferred: Number of bytes downloaded
+- elapsed_seconds: Transfer time
+- speed_kbps: Transfer speed in KB/s
+
+Example:
+```json
+{
+  "operation": "sftp_get",
+  "session_id": "mcu_1",
+  "remote_path": "/var/log/syslog",
+  "local_path": "C:/logs/remote_syslog.txt",
+  "tool_unlock_token": "..."
+}
+```
+
+### sftp_list (Phase 5M)
+List directory contents on a remote server via SFTP. Only works with SSH transport sessions.
+
+Parameters:
+- session_id (required): SSH session to use
+- remote_path (optional): Path to directory (default: current directory ".")
+
+Returns:
+- entry_count: Number of entries found
+- entries: Array of file info objects:
+  - name: Filename
+  - size: File size in bytes
+  - is_dir: True if directory
+  - mtime: Modification time (Unix timestamp)
+  - mode: File permissions (octal string like "0755")
+
+Example:
+```json
+{
+  "operation": "sftp_list",
+  "session_id": "mcu_1",
+  "remote_path": "/home/user/firmware/",
+  "tool_unlock_token": "..."
+}
+```
+
+Use Cases:
+- Upload firmware binaries to remote build servers
+- Download log files for analysis
+- Manage files on remote embedded Linux systems
+- Deploy configuration files
+- Backup remote data
 
 ## Input Examples
 
@@ -9133,6 +9422,192 @@ def handle_get_line_states(params: Dict) -> Dict:
         return create_error_response(f"Error in get_line_states: {str(e)}", with_readme=False)
 
 # ============================================================================
+# PHASE 5M: SFTP FILE TRANSFER HANDLERS
+# ============================================================================
+
+def handle_sftp_put(params: Dict) -> Dict:
+    """Handle sftp_put operation - Upload file to remote server via SFTP.
+    
+    Only works with SSH transport sessions.
+    """
+    try:
+        session_id = params.get("session_id")
+        local_path = params.get("local_path")
+        remote_path = params.get("remote_path")
+        
+        if not session_id:
+            return create_error_response("Parameter 'session_id' is required for sftp_put", with_readme=False)
+        
+        if not local_path:
+            return create_error_response("Parameter 'local_path' is required for sftp_put", with_readme=False)
+        
+        if not remote_path:
+            return create_error_response("Parameter 'remote_path' is required for sftp_put", with_readme=False)
+        
+        session = get_session(session_id)
+        if not session:
+            return create_error_response(f"Session {session_id} not found", with_readme=False)
+        
+        # Check transport exists and is SSH
+        if not session.transport:
+            return create_error_response(f"Session {session_id} has no active transport", with_readme=False)
+        
+        if not isinstance(session.transport, SSHTransport):
+            return create_error_response(
+                f"sftp_put only works with SSH sessions. Session {session_id} is using {session.metadata.transport_type} transport.",
+                with_readme=False
+            )
+        
+        MCPLogger.log(TOOL_LOG_NAME, f"SFTP PUT: {local_path} -> {remote_path} (session {session_id})")
+        
+        # Perform the transfer
+        try:
+            stats = session.transport.sftp_put(local_path, remote_path)
+            
+            result = {
+                "success": True,
+                "session_id": session_id,
+                "operation": "sftp_put",
+                "local_path": local_path,
+                "remote_path": remote_path,
+                "bytes_transferred": stats["bytes_transferred"],
+                "elapsed_seconds": round(stats["elapsed_seconds"], 2),
+                "speed_kbps": round(stats["speed_kbps"], 1),
+                "message": f"Uploaded {stats['bytes_transferred']} bytes in {stats['elapsed_seconds']:.2f}s"
+            }
+            
+            return {
+                "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                "isError": False
+            }
+            
+        except TransportError as e:
+            return create_error_response(f"SFTP upload failed: {str(e)}", with_readme=False)
+        
+    except Exception as e:
+        return create_error_response(f"Error in sftp_put: {str(e)}", with_readme=False)
+
+
+def handle_sftp_get(params: Dict) -> Dict:
+    """Handle sftp_get operation - Download file from remote server via SFTP.
+    
+    Only works with SSH transport sessions.
+    """
+    try:
+        session_id = params.get("session_id")
+        remote_path = params.get("remote_path")
+        local_path = params.get("local_path")
+        
+        if not session_id:
+            return create_error_response("Parameter 'session_id' is required for sftp_get", with_readme=False)
+        
+        if not remote_path:
+            return create_error_response("Parameter 'remote_path' is required for sftp_get", with_readme=False)
+        
+        if not local_path:
+            return create_error_response("Parameter 'local_path' is required for sftp_get", with_readme=False)
+        
+        session = get_session(session_id)
+        if not session:
+            return create_error_response(f"Session {session_id} not found", with_readme=False)
+        
+        # Check transport exists and is SSH
+        if not session.transport:
+            return create_error_response(f"Session {session_id} has no active transport", with_readme=False)
+        
+        if not isinstance(session.transport, SSHTransport):
+            return create_error_response(
+                f"sftp_get only works with SSH sessions. Session {session_id} is using {session.metadata.transport_type} transport.",
+                with_readme=False
+            )
+        
+        MCPLogger.log(TOOL_LOG_NAME, f"SFTP GET: {remote_path} -> {local_path} (session {session_id})")
+        
+        # Perform the transfer
+        try:
+            stats = session.transport.sftp_get(remote_path, local_path)
+            
+            result = {
+                "success": True,
+                "session_id": session_id,
+                "operation": "sftp_get",
+                "remote_path": remote_path,
+                "local_path": local_path,
+                "bytes_transferred": stats["bytes_transferred"],
+                "elapsed_seconds": round(stats["elapsed_seconds"], 2),
+                "speed_kbps": round(stats["speed_kbps"], 1),
+                "message": f"Downloaded {stats['bytes_transferred']} bytes in {stats['elapsed_seconds']:.2f}s"
+            }
+            
+            return {
+                "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                "isError": False
+            }
+            
+        except TransportError as e:
+            return create_error_response(f"SFTP download failed: {str(e)}", with_readme=False)
+        
+    except Exception as e:
+        return create_error_response(f"Error in sftp_get: {str(e)}", with_readme=False)
+
+
+def handle_sftp_list(params: Dict) -> Dict:
+    """Handle sftp_list operation - List directory contents on remote server via SFTP.
+    
+    Only works with SSH transport sessions.
+    """
+    try:
+        session_id = params.get("session_id")
+        remote_path = params.get("remote_path", ".")
+        
+        if not session_id:
+            return create_error_response("Parameter 'session_id' is required for sftp_list", with_readme=False)
+        
+        session = get_session(session_id)
+        if not session:
+            return create_error_response(f"Session {session_id} not found", with_readme=False)
+        
+        # Check transport exists and is SSH
+        if not session.transport:
+            return create_error_response(f"Session {session_id} has no active transport", with_readme=False)
+        
+        if not isinstance(session.transport, SSHTransport):
+            return create_error_response(
+                f"sftp_list only works with SSH sessions. Session {session_id} is using {session.metadata.transport_type} transport.",
+                with_readme=False
+            )
+        
+        MCPLogger.log(TOOL_LOG_NAME, f"SFTP LIST: {remote_path} (session {session_id})")
+        
+        # Get directory listing
+        try:
+            entries = session.transport.sftp_list(remote_path)
+            
+            # Sort: directories first, then by name
+            entries.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
+            
+            result = {
+                "success": True,
+                "session_id": session_id,
+                "operation": "sftp_list",
+                "remote_path": remote_path,
+                "entry_count": len(entries),
+                "entries": entries
+            }
+            
+            return {
+                "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                "isError": False
+            }
+            
+        except TransportError as e:
+            return create_error_response(f"SFTP listing failed: {str(e)}", with_readme=False)
+        
+    except Exception as e:
+        return create_error_response(f"Error in sftp_list: {str(e)}", with_readme=False)
+
+
+# ============================================================================
 # PHASE 3: SEQUENCE AND TERMINAL EMULATION HANDLERS
 # ============================================================================
 
@@ -9491,6 +9966,14 @@ def handle_terminal(input_param: Dict) -> Dict:
             return handle_set_terminal_emulation(validated_params)
         elif operation == "enable_bluetooth":
             return handle_enable_bluetooth(validated_params)
+        
+        # Phase 5M: SFTP file transfer operations
+        elif operation == "sftp_put":
+            return handle_sftp_put(validated_params)
+        elif operation == "sftp_get":
+            return handle_sftp_get(validated_params)
+        elif operation == "sftp_list":
+            return handle_sftp_list(validated_params)
         
         elif operation == "readme":
             return {
