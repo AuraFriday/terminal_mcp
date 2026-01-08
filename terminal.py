@@ -10,8 +10,8 @@ Supports physical serial ports and network transports (TCP, telnet, RFC2217).
 Copyright: © 2025 Christopher Nathan Drake. All rights reserved.
 SPDX-License-Identifier: Proprietary
 
-"signature": "µ𐓒8ꞇꓪr𝟩ϹwᎠᏎĐⲢ𝟨Ꙅ2Xɯ1Ꮾj1ƶƨŪꓑⴹ9ƵꓚǝƵӠᏴᎪ𐐕һᏟFʌοꓔԝVу𝟑ĸƨƶQօ𝟚ɋⲟᗪ𝟑qA𝐴𝖠ꞇ8ΕᒿꓚǝᗅΡⲦ𝟙mμ𝘈EΡfᴠҮᴜWigNRⲢĵƐƨȢɯЅƘᏴϜН3ƧбеϜϨϹбꓑģᎬƛXÞ"
-"signdate": "2025-11-20T22:48:00.000Z",
+"signature": "еģ9МցꙅAƐAµᎬꓠꓗτᴅycıᴡȷВցⲞ𝟢ΡKIQģɯоdsÞΑyеԛƶᎠBոԁiТꓟnω𝟙𝟫օ𝛢ƍƛģA𝟫𐓒ꓐТᗪνȣɋrɅƊĵСꓬᎪՕıGуkꜱᴍ𐓒Јԁꓮ𝟩R𝟑H𝟤ꓪЈıꓜƋQwȜɯꓟTоʌѵᎪꓬᒿᴠωƋEꙅ"
+"signdate": "2026-01-07T23:30:26.008Z",
 """
 
 import json
@@ -39,7 +39,7 @@ _bleak = None
 
 # Constants
 TOOL_LOG_NAME = "TERMINAL"
-VERSION = "1.10.0-phase5l-autoreconnect"  # Phase 5L: Auto-reconnect support for persistent connections
+VERSION = "1.11.2-phase6a-tls-ipv6"  # Phase 6A: TLS/SSL support + Full IPv6 support (parsing + connection)
 
 # Module-level token generated once at import time
 TOOL_UNLOCK_TOKEN = get_tool_token(__file__)
@@ -770,12 +770,17 @@ def parse_endpoint(endpoint: str) -> Tuple[str, Dict]:
         ValueError: Invalid endpoint format
     """
     if endpoint.startswith("tcp://"):
-        # TCP endpoint: tcp://host:port
-        parts = endpoint[6:].split(":")
+        # TCP endpoint: tcp://host:port or tcp://[ipv6]:port
+        # Use rsplit to handle IPv6 addresses with colons
+        parts = endpoint[6:].rsplit(":", 1)
         if len(parts) != 2:
-            raise ValueError(f"Invalid TCP endpoint format: {endpoint} (expected tcp://host:port)")
+            raise ValueError(f"Invalid TCP endpoint format: {endpoint} (expected tcp://host:port or tcp://[ipv6]:port)")
         
         host = parts[0]
+        # Strip brackets from IPv6 addresses
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        
         try:
             port = int(parts[1])
         except ValueError:
@@ -790,12 +795,17 @@ def parse_endpoint(endpoint: str) -> Tuple[str, Dict]:
         return ("tcp", {"host": host, "port": port})
     
     elif endpoint.startswith("telnet://"):
-        # Telnet endpoint: telnet://host:port (Phase 5B)
-        parts = endpoint[9:].split(":")
+        # Telnet endpoint: telnet://host:port or telnet://[ipv6]:port (Phase 5B)
+        # Use rsplit to handle IPv6 addresses with colons
+        parts = endpoint[9:].rsplit(":", 1)
         if len(parts) != 2:
-            raise ValueError(f"Invalid telnet endpoint format: {endpoint} (expected telnet://host:port)")
+            raise ValueError(f"Invalid telnet endpoint format: {endpoint} (expected telnet://host:port or telnet://[ipv6]:port)")
         
         host = parts[0]
+        # Strip brackets from IPv6 addresses
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        
         try:
             port = int(parts[1])
         except ValueError:
@@ -810,12 +820,17 @@ def parse_endpoint(endpoint: str) -> Tuple[str, Dict]:
         return ("telnet", {"host": host, "port": port})
     
     elif endpoint.startswith("rfc2217://"):
-        # RFC2217 endpoint: rfc2217://host:port (Phase 5G)
-        parts = endpoint[10:].split(":")
+        # RFC2217 endpoint: rfc2217://host:port or rfc2217://[ipv6]:port (Phase 5G)
+        # Use rsplit to handle IPv6 addresses with colons
+        parts = endpoint[10:].rsplit(":", 1)
         if len(parts) != 2:
-            raise ValueError(f"Invalid RFC2217 endpoint format: {endpoint} (expected rfc2217://host:port)")
+            raise ValueError(f"Invalid RFC2217 endpoint format: {endpoint} (expected rfc2217://host:port or rfc2217://[ipv6]:port)")
         
         host = parts[0]
+        # Strip brackets from IPv6 addresses
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        
         try:
             port = int(parts[1])
         except ValueError:
@@ -830,7 +845,7 @@ def parse_endpoint(endpoint: str) -> Tuple[str, Dict]:
         return ("rfc2217", {"host": host, "port": port})
     
     elif endpoint.startswith("ssh://"):
-        # SSH endpoint: ssh://user@host:port or ssh://host:port (Phase 5C)
+        # SSH endpoint: ssh://user@host:port or ssh://host:port or ssh://[user@][ipv6]:port (Phase 5C)
         rest = endpoint[6:]  # Remove "ssh://"
         
         # Parse user@host:port or host:port
@@ -838,12 +853,16 @@ def parse_endpoint(endpoint: str) -> Tuple[str, Dict]:
         if "@" in rest:
             username, rest = rest.split("@", 1)
         
-        # Parse host:port
-        parts = rest.split(":")
+        # Parse host:port - use rsplit to handle IPv6 addresses with colons
+        parts = rest.rsplit(":", 1)
         if len(parts) != 2:
-            raise ValueError(f"Invalid SSH endpoint format: {endpoint} (expected ssh://[user@]host:port)")
+            raise ValueError(f"Invalid SSH endpoint format: {endpoint} (expected ssh://[user@]host:port or ssh://[user@][ipv6]:port)")
         
         host = parts[0]
+        # Strip brackets from IPv6 addresses
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        
         try:
             port = int(parts[1])
         except ValueError:
@@ -998,27 +1017,41 @@ class TCPTransport(BaseTransport):
         self.socket = None
         
         try:
-            # Create socket
-            MCPLogger.log(TOOL_LOG_NAME, f"TCP socket.socket() creating...")
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            MCPLogger.log(TOOL_LOG_NAME, f"TCP socket.socket() created OK")
+            # Use getaddrinfo to support both IPv4 and IPv6
+            MCPLogger.log(TOOL_LOG_NAME, f"TCP resolving {host}:{port}...")
+            addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            if not addr_info:
+                raise TransportConnectionError(f"Could not resolve {host}")
             
-            MCPLogger.log(TOOL_LOG_NAME, f"TCP socket.settimeout({connect_timeout})...")
-            self.socket.settimeout(connect_timeout)
-            MCPLogger.log(TOOL_LOG_NAME, f"TCP socket.settimeout({connect_timeout}) OK")
+            # Try each address until one succeeds
+            last_error = None
+            for family, socktype, proto, canonname, sockaddr in addr_info:
+                try:
+                    MCPLogger.log(TOOL_LOG_NAME, f"TCP trying {family} to {sockaddr}...")
+                    self.socket = socket.socket(family, socktype, proto)
+                    self.socket.settimeout(connect_timeout)
+                    self.socket.connect(sockaddr)
+                    
+                    # Set non-blocking for reads (match serial pattern)
+                    self.socket.setblocking(False)
+                    MCPLogger.log(TOOL_LOG_NAME, f"TCP connected to {host}:{port} via {sockaddr} - READY")
+                    break  # Success!
+                    
+                except Exception as e:
+                    last_error = e
+                    if self.socket:
+                        try:
+                            self.socket.close()
+                        except:
+                            pass
+                        self.socket = None
+                    continue  # Try next address
             
-            # Connect
-            MCPLogger.log(TOOL_LOG_NAME, f"TCP socket.connect(({host}, {port})) starting...")
-            self.socket.connect((host, port))
-            MCPLogger.log(TOOL_LOG_NAME, f"TCP socket.connect(({host}, {port})) completed!")
+            if not self.socket:
+                raise TransportConnectionError(f"TCP connection to {host}:{port} failed: {last_error}")
             
-            # Set non-blocking for reads (match serial pattern)
-            MCPLogger.log(TOOL_LOG_NAME, f"TCP socket.setblocking(False)...")
-            self.socket.setblocking(False)
-            MCPLogger.log(TOOL_LOG_NAME, f"TCP socket.setblocking(False) OK")
-            
-            MCPLogger.log(TOOL_LOG_NAME, f"TCP connected to {host}:{port} - READY")
-            
+        except TransportConnectionError:
+            raise  # Re-raise our own exceptions
         except Exception as e:
             if self.socket:
                 try:
@@ -1930,6 +1963,464 @@ class WebSocketTransport(BaseTransport):
             "baud_rate": False,
             "flow_control": False
         }
+
+
+class TLSWrapper(BaseTransport):
+    """Wraps any stream-based transport with TLS/SSL encryption - Phase 6A.
+    
+    Transport-agnostic TLS wrapper that can encrypt ANY stream-based transport:
+    - TCP sockets (most common: SMTPS, IMAPS, POP3S, HTTPS)
+    - Unix domain sockets (encrypted local IPC)
+    - Named pipes (encrypted Windows pipes)
+    - Telnet connections (TLS over telnet)
+    - RFC2217 connections (encrypted remote serial)
+    - Even serial ports (exotic but technically possible)
+    
+    Does NOT work with:
+    - WebSocket (use wss:// instead - already has TLS)
+    - SSH (already encrypted)
+    - Bluetooth/BLE (have their own encryption)
+    
+    Use Cases:
+    - Secure mail protocols (SMTP/IMAP/POP3 with TLS)
+    - STARTTLS upgrade (plain connection → encrypted)
+    - Encrypted local IPC
+    - Any protocol that needs transport-layer encryption
+    
+    Features:
+    - Direct TLS (connect with encryption from start)
+    - STARTTLS (upgrade existing connection to TLS)
+    - Certificate inspection (view server cert details)
+    - Optional certificate verification (can disable for self-signed)
+    - SNI (Server Name Indication) support
+    - Automatic protocol version negotiation (TLS 1.2, 1.3)
+    
+    Architecture:
+    - Decorator pattern: wraps any BaseTransport
+    - Delegates to underlying transport for actual I/O
+    - SSL socket wraps the underlying socket
+    - Certificate info cached in wrapper for inspection
+    """
+    
+    def __init__(self, base_transport: BaseTransport, 
+                 verify_cert: bool = True,
+                 server_hostname: str = None,
+                 cert_file: str = None,
+                 key_file: str = None,
+                 ca_file: str = None):
+        """Wrap an existing transport with TLS encryption.
+        
+        Args:
+            base_transport: Underlying transport (TCP, Unix, etc.)
+            verify_cert: Verify server certificate (default True for security)
+            server_hostname: Server hostname for SNI and cert verification
+            cert_file: Client certificate file (optional, for client auth)
+            key_file: Client key file (optional, for client auth)
+            ca_file: CA bundle file (optional, for custom CAs)
+            
+        Raises:
+            TransportError: If TLS handshake fails
+            TransportConnectionError: If underlying transport is not open
+        """
+        import ssl
+        import socket
+        
+        self.base_transport = base_transport
+        self.verify_cert = verify_cert
+        self.server_hostname = server_hostname
+        self.ssl_socket = None
+        self.tls_info = {}  # Certificate and connection info
+        
+        # Verify base transport is open
+        if not base_transport.is_open():
+            raise TransportConnectionError("Cannot wrap closed transport with TLS")
+        
+        MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Wrapping {base_transport.__class__.__name__} with TLS (verify={verify_cert}, hostname={server_hostname})")
+        
+        try:
+            # Create SSL context
+            context = ssl.create_default_context()
+            
+            # Configure certificate verification
+            if not verify_cert:
+                MCPLogger.log(TOOL_LOG_NAME, "[TLSWrapper] WARNING: Certificate verification DISABLED")
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            else:
+                context.check_hostname = True
+                context.verify_mode = ssl.CERT_REQUIRED
+            
+            # Load custom CA bundle if provided
+            if ca_file:
+                MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Loading CA bundle from {ca_file}")
+                context.load_verify_locations(cafile=ca_file)
+            
+            # Load client certificate if provided
+            if cert_file:
+                MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Loading client certificate from {cert_file}")
+                context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+            
+            # Get the underlying socket from base transport
+            # This works for TCP, Unix, Pipe, Telnet (which wraps TCP), etc.
+            underlying_socket = self._extract_socket_from_transport(base_transport)
+            
+            if underlying_socket is None:
+                raise TransportError(f"Cannot extract socket from {base_transport.__class__.__name__} for TLS wrapping")
+            
+            # Temporarily set socket to blocking for TLS handshake
+            # (SSL handshake requires blocking socket)
+            was_blocking = underlying_socket.getblocking()
+            if not was_blocking:
+                MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Temporarily setting socket to blocking for TLS handshake")
+                underlying_socket.setblocking(True)
+            
+            # Wrap socket with SSL and perform handshake
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Starting TLS handshake (server_hostname={server_hostname})")
+            self.ssl_socket = context.wrap_socket(
+                underlying_socket,
+                server_hostname=server_hostname,
+                do_handshake_on_connect=True
+            )
+            
+            # CRITICAL: Update base transport's socket reference!
+            # After wrap_socket(), the original socket is consumed and invalid.
+            # We must update the base transport to point to the SSL socket.
+            self._update_base_transport_socket(base_transport, self.ssl_socket)
+            
+            # Set back to non-blocking mode (match base transport behavior)
+            self.ssl_socket.setblocking(False)
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] TLS handshake complete, socket set to non-blocking mode")
+            
+            # Extract certificate information
+            self._extract_certificate_info()
+            
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] TLS handshake complete! Protocol: {self.tls_info.get('tls_version', 'unknown')}, Cipher: {self.tls_info.get('cipher', 'unknown')}")
+            
+        except ssl.SSLError as e:
+            error_msg = f"TLS handshake failed: {e}"
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] ERROR: {error_msg}")
+            raise TransportError(error_msg) from e
+        except Exception as e:
+            error_msg = f"Failed to wrap transport with TLS: {e}"
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] ERROR: {error_msg}")
+            raise TransportError(error_msg) from e
+    
+    def _extract_socket_from_transport(self, transport: BaseTransport):
+        """Extract underlying socket from transport for TLS wrapping.
+        
+        This method knows how to extract sockets from various transport types.
+        Works with: TCP, Unix, Pipe, Telnet (wraps TCP), RFC2217 (wraps Telnet wraps TCP).
+        
+        Returns:
+            socket.socket or None if cannot extract
+        """
+        # TCPTransport: has .socket attribute
+        if hasattr(transport, 'socket') and transport.socket is not None:
+            return transport.socket
+        
+        # TelnetTransport: wraps TCPTransport via .tcp attribute
+        if hasattr(transport, 'tcp') and hasattr(transport.tcp, 'socket'):
+            return transport.tcp.socket
+        
+        # UnixSocketTransport: has .socket attribute
+        # NamedPipeTransport: has .socket attribute (on Windows, named pipes use sockets)
+        # SerialTransport: does NOT have socket (uses pyserial)
+        
+        # If we can't extract socket, return None
+        return None
+    
+    def _update_base_transport_socket(self, transport: BaseTransport, ssl_socket):
+        """Update base transport's socket reference to point to SSL socket.
+        
+        After wrap_socket(), the original socket is consumed and becomes invalid.
+        We must update the base transport to use the SSL socket instead.
+        This is critical for STARTTLS where the worker thread continues using
+        the base transport.
+        
+        Args:
+            transport: Base transport to update
+            ssl_socket: New SSL socket to use
+        """
+        # TCPTransport: update .socket attribute
+        if hasattr(transport, 'socket'):
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Updating {transport.__class__.__name__}.socket to SSL socket")
+            transport.socket = ssl_socket
+        
+        # TelnetTransport: update wrapped TCP's socket
+        if hasattr(transport, 'tcp') and hasattr(transport.tcp, 'socket'):
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Updating {transport.tcp.__class__.__name__}.socket (via Telnet wrapper) to SSL socket")
+            transport.tcp.socket = ssl_socket
+        
+        # UnixSocketTransport, NamedPipeTransport: also have .socket attribute
+        # The above hasattr check handles them
+    
+    def _extract_certificate_info(self):
+        """Extract certificate information from SSL socket for inspection."""
+        import ssl
+        from datetime import datetime
+        
+        try:
+            # Get peer certificate (server's certificate)
+            cert_binary = self.ssl_socket.getpeercert(binary_form=True)
+            cert_dict = self.ssl_socket.getpeercert()
+            
+            # Get TLS version and cipher
+            self.tls_info['tls_version'] = self.ssl_socket.version()
+            self.tls_info['cipher'] = self.ssl_socket.cipher()[0] if self.ssl_socket.cipher() else 'unknown'
+            self.tls_info['cipher_bits'] = self.ssl_socket.cipher()[2] if self.ssl_socket.cipher() and len(self.ssl_socket.cipher()) > 2 else 0
+            
+            if cert_dict:
+                # Extract subject (who the cert is for)
+                subject = dict(x[0] for x in cert_dict.get('subject', []))
+                self.tls_info['subject'] = subject
+                
+                # Extract issuer (who signed the cert)
+                issuer = dict(x[0] for x in cert_dict.get('issuer', []))
+                self.tls_info['issuer'] = issuer
+                
+                # Extract validity dates
+                self.tls_info['not_before'] = cert_dict.get('notBefore', '')
+                self.tls_info['not_after'] = cert_dict.get('notAfter', '')
+                
+                # Extract serial number
+                self.tls_info['serial_number'] = cert_dict.get('serialNumber', '')
+                
+                # Extract Subject Alternative Names (SAN)
+                san_list = []
+                for san_type, san_value in cert_dict.get('subjectAltName', []):
+                    if san_type == 'DNS':
+                        san_list.append(san_value)
+                self.tls_info['san'] = san_list
+            
+            # Calculate certificate fingerprint (SHA256)
+            if cert_binary:
+                import hashlib
+                fingerprint = hashlib.sha256(cert_binary).hexdigest()
+                # Format as colon-separated hex (standard format)
+                self.tls_info['fingerprint_sha256'] = ':'.join(fingerprint[i:i+2] for i in range(0, len(fingerprint), 2))
+            
+            # Verification status
+            self.tls_info['verified'] = self.verify_cert
+            
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Certificate info extracted: Subject={subject.get('commonName', 'unknown')}, Issuer={issuer.get('commonName', 'unknown')}")
+            
+        except Exception as e:
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] WARNING: Failed to extract certificate info: {e}")
+            # Non-fatal - connection still works, just no cert info
+    
+    # ========================================================================
+    # Core I/O (delegate to SSL socket)
+    # ========================================================================
+    
+    def write(self, data: bytes) -> int:
+        """Write data through TLS connection.
+        
+        For non-blocking SSL sockets, we need to handle partial writes and retry.
+        This method ensures all data is sent (like TCPTransport.sendall()).
+        
+        Args:
+            data: Bytes to write
+            
+        Returns:
+            Number of bytes written (always len(data) on success)
+            
+        Raises:
+            TransportConnectionError: Connection lost
+            TransportError: SSL error
+        """
+        import ssl
+        import time
+        
+        total_sent = 0
+        while total_sent < len(data):
+            try:
+                bytes_sent = self.ssl_socket.send(data[total_sent:])
+                total_sent += bytes_sent
+                if bytes_sent == 0 and total_sent < len(data):
+                    # No progress - socket might be blocked
+                    time.sleep(0.001)  # Brief pause before retry
+            except ssl.SSLWantWriteError:
+                # Socket not ready for write (non-blocking) - wait and retry
+                time.sleep(0.001)
+                continue
+            except ssl.SSLWantReadError:
+                # SSL needs to read before it can write (renegotiation) - wait and retry
+                time.sleep(0.001)
+                continue
+            except ssl.SSLError as e:
+                MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] SSL write error after {total_sent} bytes: {e}")
+                raise TransportError(f"TLS write failed: {e}") from e
+            except Exception as e:
+                MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Write error after {total_sent} bytes: {e}")
+                raise TransportConnectionError(f"TLS connection lost: {e}") from e
+        
+        MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Sent {total_sent} bytes (encrypted)")
+        return total_sent
+    
+    def read(self, size: int) -> bytes:
+        """Read data through TLS connection (non-blocking).
+        
+        Args:
+            size: Maximum bytes to read
+            
+        Returns:
+            Bytes read (may be empty if no data available)
+            
+        Raises:
+            TransportConnectionError: Connection lost
+            TransportError: SSL error
+        """
+        import ssl
+        
+        try:
+            data = self.ssl_socket.recv(size)
+            if data:
+                MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Received {len(data)} bytes (encrypted)")
+                return data
+            else:
+                # Empty recv() on SSL socket could mean:
+                # 1. No data available (non-blocking) - should have raised SSLWantReadError
+                # 2. Connection closed (EOF)
+                # For non-blocking SSL, empty return usually means no data, not EOF
+                # (EOF would raise an exception)
+                return b''
+        except ssl.SSLWantReadError:
+            # No data available (non-blocking socket) - this is normal
+            return b''
+        except BlockingIOError:
+            # Also handle BlockingIOError (some SSL implementations use this)
+            return b''
+        except ssl.SSLError as e:
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] SSL read error: {e}")
+            raise TransportError(f"TLS read failed: {e}") from e
+        except Exception as e:
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Read error: {e}")
+            raise TransportConnectionError(f"TLS connection lost: {e}") from e
+    
+    def close(self) -> None:
+        """Close TLS connection.
+        
+        Note: We only close the SSL socket, not the base transport.
+        The SSL socket owns the underlying socket after wrap_socket(),
+        so closing the SSL socket properly closes everything.
+        Trying to close the base transport would fail because its socket
+        reference is stale after being consumed by wrap_socket().
+        """
+        if self.ssl_socket:
+            try:
+                MCPLogger.log(TOOL_LOG_NAME, "[TLSWrapper] Closing TLS connection")
+                self.ssl_socket.close()
+            except:
+                pass  # Ignore errors during close
+            finally:
+                self.ssl_socket = None
+        
+        # DO NOT close base_transport - its socket is now owned by ssl_socket
+        # Closing it would cause "operation on non-socket" errors
+    
+    def is_open(self) -> bool:
+        """Check if TLS connection is still open."""
+        if not self.ssl_socket:
+            return False
+        
+        # Check if underlying transport is open
+        if not self.base_transport.is_open():
+            return False
+        
+        # SSL socket is open if we can query its state
+        try:
+            # Try to peek at socket state
+            self.ssl_socket.getpeername()
+            return True
+        except:
+            return False
+    
+    def flush(self) -> None:
+        """Flush buffers (delegate to base transport)."""
+        if self.base_transport:
+            self.base_transport.flush()
+    
+    def bytes_available(self) -> int:
+        """Return bytes available to read from SSL internal buffer.
+        
+        SSL sockets buffer decrypted data internally. Use pending() to check.
+        This is important for the worker thread to know when to read.
+        """
+        try:
+            if self.ssl_socket:
+                return self.ssl_socket.pending()
+            return 0
+        except:
+            return 0
+    
+    # ========================================================================
+    # Serial control lines (delegate to base transport if supported)
+    # ========================================================================
+    
+    def set_dtr(self, value: bool) -> None:
+        """Set DTR line (if base transport supports it)."""
+        if self.base_transport:
+            self.base_transport.set_dtr(value)
+    
+    def set_rts(self, value: bool) -> None:
+        """Set RTS line (if base transport supports it)."""
+        if self.base_transport:
+            self.base_transport.set_rts(value)
+    
+    def get_line_states(self) -> Dict[str, bool]:
+        """Get line states (if base transport supports it)."""
+        if self.base_transport:
+            return self.base_transport.get_line_states()
+        raise TransportError("Base transport does not support line states")
+    
+    def set_baud_rate(self, rate: int) -> None:
+        """Change baud rate (if base transport supports it)."""
+        if self.base_transport:
+            self.base_transport.set_baud_rate(rate)
+    
+    def send_break(self, duration: float = 0.25) -> None:
+        """Send BREAK signal (if base transport supports it)."""
+        if self.base_transport:
+            self.base_transport.send_break(duration)
+    
+    # ========================================================================
+    # Capabilities (delegate to base transport)
+    # ========================================================================
+    
+    def get_capabilities(self) -> Dict[str, bool]:
+        """Return capabilities of base transport."""
+        if self.base_transport:
+            return self.base_transport.get_capabilities()
+        return {
+            "dtr_rts": False,
+            "line_states": False,
+            "break_signal": False,
+            "baud_rate": False,
+            "flow_control": False
+        }
+    
+    # ========================================================================
+    # TLS-specific methods
+    # ========================================================================
+    
+    def get_tls_info(self) -> Dict:
+        """Get TLS connection and certificate information.
+        
+        Returns:
+            Dict with keys:
+                - tls_version: TLS protocol version (e.g., "TLSv1.3")
+                - cipher: Cipher suite name
+                - cipher_bits: Cipher strength in bits
+                - subject: Certificate subject (dict)
+                - issuer: Certificate issuer (dict)
+                - not_before: Certificate validity start date
+                - not_after: Certificate validity end date
+                - serial_number: Certificate serial number
+                - fingerprint_sha256: SHA256 fingerprint (colon-separated hex)
+                - san: List of Subject Alternative Names
+                - verified: Whether certificate was verified
+        """
+        return self.tls_info.copy()
 
 
 class BluetoothTransport(BaseTransport):
@@ -3734,7 +4225,7 @@ class UnixSocketTransport(BaseTransport):
 
 
 class NamedPipeTransport(BaseTransport):
-    """Transport for Named Pipes (Windows) and FIFOs (POSIX) - Phase 5F.
+    r"""Transport for Named Pipes (Windows) and FIFOs (POSIX) - Phase 5F.
     
     Connects to named pipes for inter-process communication.
     
@@ -3755,7 +4246,7 @@ class NamedPipeTransport(BaseTransport):
     """
     
     def __init__(self, pipe_path: str, timeout: float = 10.0, mode: str = "rw"):
-        """Initialize named pipe transport.
+        r"""Initialize named pipe transport.
         
         Args:
             pipe_path: Path to named pipe
@@ -4022,6 +4513,11 @@ class terminal_session_metadata:
     # Phase 5L: Auto-reconnect support
     auto_reconnect_enabled: bool = False  # Enable persistent connection mode
     auto_reconnect_interval_ms: int = 500  # Retry interval in milliseconds
+    
+    # Phase 6A: TLS/SSL support
+    tls_enabled: bool = False  # Whether TLS is active on this session
+    tls_cert_fingerprint: str = ""  # SHA256 fingerprint of server certificate
+    tls_cert_subject: str = ""  # Certificate subject CN
     
     def __post_init__(self):
         if self.last_activity_time is None:
@@ -6123,11 +6619,21 @@ def create_transport_from_params(connection_params: Dict) -> Optional[BaseTransp
         return SerialTransport(serial_port)
     
     elif transport_type == "tcp":
-        return TCPTransport(
+        transport = TCPTransport(
             connection_params["host"],
             connection_params["port"],
             connection_params.get("connect_timeout", 10.0)
         )
+        
+        # Phase 6A: Wrap with TLS if requested
+        if connection_params.get("use_tls", False):
+            transport = TLSWrapper(
+                transport,
+                verify_cert=connection_params.get("tls_verify", True),
+                server_hostname=connection_params.get("tls_server_hostname") or connection_params["host"]
+            )
+        
+        return transport
     
     elif transport_type == "telnet":
         tcp_transport = TCPTransport(
@@ -6135,6 +6641,15 @@ def create_transport_from_params(connection_params: Dict) -> Optional[BaseTransp
             connection_params["port"],
             connection_params.get("connect_timeout", 10.0)
         )
+        
+        # Phase 6A: Wrap TCP with TLS if requested (before Telnet layer)
+        if connection_params.get("use_tls", False):
+            tcp_transport = TLSWrapper(
+                tcp_transport,
+                verify_cert=connection_params.get("tls_verify", True),
+                server_hostname=connection_params.get("tls_server_hostname") or connection_params["host"]
+            )
+        
         return TelnetTransport(tcp_transport, raw_mode=False)
     
     elif transport_type == "rfc2217":
@@ -6143,6 +6658,15 @@ def create_transport_from_params(connection_params: Dict) -> Optional[BaseTransp
             connection_params["port"],
             connection_params.get("connect_timeout", 10.0)
         )
+        
+        # Phase 6A: Wrap TCP with TLS if requested (before RFC2217 layer)
+        if connection_params.get("use_tls", False):
+            tcp_transport = TLSWrapper(
+                tcp_transport,
+                verify_cert=connection_params.get("tls_verify", True),
+                server_hostname=connection_params.get("tls_server_hostname") or connection_params["host"]
+            )
+        
         transport = RFC2217Transport(tcp_transport)
         if connection_params.get("rfc2217_baud", 115200) != 115200:
             transport.set_baud_rate(connection_params["rfc2217_baud"])
@@ -6278,7 +6802,7 @@ TOOLS = [
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["readme", "list_ports", "discover_network", "discover_bluetooth", "discover_ble", "bleak", "bleak_get_notifications", "bleak_disconnect", "open_session", "close_session", "list_sessions", "get_session_info", "send_data", "read_data", "wait_for_pattern", "send_async", "get_async_status", "cancel_async", "set_baud", "send_break", "get_line_states", "send_sequence", "get_sequence_status", "cancel_sequence", "set_terminal_emulation", "enable_bluetooth", "sftp_put", "sftp_get", "sftp_list"],
+                    "enum": ["readme", "list_ports", "discover_network", "discover_bluetooth", "discover_ble", "bleak", "bleak_get_notifications", "bleak_disconnect", "open_session", "close_session", "list_sessions", "get_session_info", "send_data", "read_data", "wait_for_pattern", "send_async", "get_async_status", "cancel_async", "set_baud", "send_break", "get_line_states", "send_sequence", "get_sequence_status", "cancel_sequence", "set_terminal_emulation", "enable_bluetooth", "sftp_put", "sftp_get", "sftp_list", "upgrade_to_tls", "get_tls_info"],
                     "description": "Operation to perform"
                 },
                 "session_id": {
@@ -6604,6 +7128,20 @@ TOOLS = [
                     "type": "string",
                     "default": "uart",
                     "description": "BLE connection mode: 'uart' (Nordic UART Service) or 'generic' (manual GATT operations)"
+                },
+                "use_tls": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Wrap transport with TLS/SSL encryption (Phase 6A). Works with TCP, telnet, RFC2217, Unix sockets, named pipes. Use for secure mail (SMTPS/IMAPS/POP3S), HTTPS, or any protocol requiring transport-layer encryption."
+                },
+                "tls_verify": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Verify server certificate when using TLS (default True for security). Set to False for self-signed certificates. Only used when use_tls=True."
+                },
+                "tls_server_hostname": {
+                    "type": "string",
+                    "description": "Server hostname for SNI and certificate verification (optional, defaults to host from endpoint). Only used when use_tls=True."
                 }
             },
             "required": ["operation", "tool_unlock_token"],
@@ -6996,6 +7534,18 @@ Parameters:
   * Faster = more responsive but higher CPU, slower = gentler on system
   * For serial ports, also checks if port exists before attempting connection
 
+**TLS/SSL parameters** (Phase 6A - works with TCP, telnet, RFC2217, Unix sockets, named pipes):
+- use_tls (optional): Wrap transport with TLS/SSL encryption (default False)
+  * Enables direct TLS connection (encrypted from start)
+  * Use for: SMTPS (port 465/52465), IMAPS (port 993/52993), POP3S (port 995/52995), HTTPS, etc.
+  * For STARTTLS (plain → encrypted), use `upgrade_to_tls` operation instead
+- tls_verify (optional): Verify server certificate (default True for security)
+  * Set to False for self-signed certificates
+  * Only used when use_tls=True
+- tls_server_hostname (optional): Server hostname for SNI and certificate verification
+  * Auto-detected from endpoint if not provided
+  * Only used when use_tls=True
+
 Returns: session_id, log_file_path, transport_type, and connection status
 
 **SSH-specific parameters** (ignored for serial/TCP/Telnet):
@@ -7040,6 +7590,15 @@ Returns: session_id, log_file_path, transport_type, and connection status
 
 // Auto-reconnect enabled for ESP32 that resets (Phase 5L - captures boot logs!)
 {"operation": "open_session", "endpoint": "COM22", "baud_rate": 115200, "auto_reconnect": true, "tool_unlock_token": "..."}
+
+// Direct TLS connection (Phase 6A - encrypted from start)
+{"operation": "open_session", "endpoint": "tcp://mail.example.com:465", "use_tls": true, "tls_verify": false, "tool_unlock_token": "..."}
+
+// Secure IMAP connection
+{"operation": "open_session", "endpoint": "tcp://mail.example.com:993", "use_tls": true, "tool_unlock_token": "..."}
+
+// TLS over telnet (encrypted telnet)
+{"operation": "open_session", "endpoint": "telnet://device.local:992", "use_tls": true, "tls_verify": false, "tool_unlock_token": "..."}
 
 // Auto-reconnect with faster retry for time-critical boot log capture
 {"operation": "open_session", "endpoint": "COM22", "auto_reconnect": true, "auto_reconnect_interval_ms": 100, "tool_unlock_token": "..."}
@@ -7337,6 +7896,80 @@ Returns:
 - rts: Request To Send (output, current state)
 
 Use Case: Monitor hardware flow control state, debug wiring issues.
+
+### upgrade_to_tls (Phase 6A)
+Upgrade an existing plain connection to TLS/SSL encryption (STARTTLS pattern).
+
+Use this operation after negotiating STARTTLS with the server. The operation wraps
+the current transport with TLS encryption without closing the connection.
+
+**Typical STARTTLS Flow:**
+1. Open plain connection: `open_session` with TCP/telnet/RFC2217
+2. Negotiate STARTTLS: `send_data "STARTTLS\\r\\n"`
+3. Wait for ready: `read_data` (server responds "220 Ready to start TLS")
+4. Upgrade to TLS: `upgrade_to_tls`
+5. Continue with encrypted connection
+
+Parameters:
+- session_id (required): Session to upgrade
+- tls_verify (optional): Verify server certificate (default True)
+- tls_server_hostname (optional): Server hostname for SNI (auto-detected from connection params)
+
+Returns:
+- success: true
+- tls_enabled: true
+- tls_version: TLS protocol version (e.g., "TLSv1.3")
+- tls_cipher: Cipher suite name
+- tls_verified: Whether certificate was verified
+- tls_cert_subject: Certificate subject CN
+- tls_cert_fingerprint: SHA256 fingerprint
+
+Example (SMTP STARTTLS):
+```json
+// 1. Open plain SMTP connection
+{"operation": "open_session", "endpoint": "tcp://mail.example.com:25", "tool_unlock_token": "..."}
+
+// 2. Send EHLO and STARTTLS
+{"operation": "send_data", "session_id": "mcu_1", "data": "EHLO client.local\\r\\n", "tool_unlock_token": "..."}
+{"operation": "read_data", "session_id": "mcu_1", "tool_unlock_token": "..."}
+{"operation": "send_data", "session_id": "mcu_1", "data": "STARTTLS\\r\\n", "tool_unlock_token": "..."}
+{"operation": "read_data", "session_id": "mcu_1", "tool_unlock_token": "..."}
+
+// 3. Upgrade to TLS
+{"operation": "upgrade_to_tls", "session_id": "mcu_1", "tls_verify": false, "tool_unlock_token": "..."}
+
+// 4. Continue with encrypted connection
+{"operation": "send_data", "session_id": "mcu_1", "data": "EHLO client.local\\r\\n", "tool_unlock_token": "..."}
+```
+
+### get_tls_info (Phase 6A)
+Get detailed information about TLS connection and server certificate.
+
+Returns comprehensive TLS connection details including protocol version, cipher suite,
+and full certificate information. Useful for security auditing and debugging.
+
+Parameters:
+- session_id (required): Session to query
+
+Returns:
+- tls_enabled: Whether TLS is active
+- tls_version: TLS protocol version (e.g., "TLSv1.3")
+- cipher: Cipher suite name
+- cipher_bits: Cipher strength in bits
+- certificate: Certificate details object:
+  - subject: Certificate subject (dict with CN, O, etc.)
+  - issuer: Certificate issuer (dict with CN, O, etc.)
+  - not_before: Validity start date
+  - not_after: Validity end date
+  - serial_number: Certificate serial number
+  - fingerprint_sha256: SHA256 fingerprint (colon-separated hex)
+  - san: List of Subject Alternative Names
+- verified: Whether certificate was verified
+
+Example:
+```json
+{"operation": "get_tls_info", "session_id": "mcu_1", "tool_unlock_token": "..."}
+```
 
 ### sftp_put (Phase 5M)
 Upload a file to a remote server via SFTP. Only works with SSH transport sessions.
@@ -7828,18 +8461,44 @@ def handle_open_session(params: Dict) -> Dict:
                 host = connection_params["host"]
                 port = connection_params["port"]
                 
+                # Phase 6A: TLS parameters
+                use_tls = params.get("use_tls", False)
+                tls_verify = params.get("tls_verify", True)
+                tls_server_hostname = params.get("tls_server_hostname") or host
+                
                 # Phase 5L: Store connection params BEFORE attempting connection
                 session.connection_params = {
                     "transport_type": "tcp",
                     "host": host,
                     "port": port,
                     "connect_timeout": connect_timeout,
+                    "use_tls": use_tls,
+                    "tls_verify": tls_verify,
+                    "tls_server_hostname": tls_server_hostname,
                 }
                 
-                MCPLogger.log(TOOL_LOG_NAME, f"Opening TCP connection: {host}:{port} (timeout: {connect_timeout}s)")
+                MCPLogger.log(TOOL_LOG_NAME, f"Opening TCP connection: {host}:{port} (timeout: {connect_timeout}s, TLS: {use_tls})")
                 
                 # Create TCP transport (connection happens in __init__)
                 session.transport = TCPTransport(host, port, connect_timeout)
+                
+                # Phase 6A: Wrap with TLS if requested
+                if use_tls:
+                    MCPLogger.log(TOOL_LOG_NAME, f"Wrapping TCP transport with TLS (verify={tls_verify}, hostname={tls_server_hostname})")
+                    session.transport = TLSWrapper(
+                        session.transport,
+                        verify_cert=tls_verify,
+                        server_hostname=tls_server_hostname
+                    )
+                    
+                    # Store TLS info in metadata
+                    session.metadata.tls_enabled = True
+                    tls_info = session.transport.get_tls_info()
+                    session.metadata.tls_cert_fingerprint = tls_info.get("fingerprint_sha256", "")
+                    subject = tls_info.get("subject", {})
+                    session.metadata.tls_cert_subject = subject.get("commonName", "") if isinstance(subject, dict) else ""
+                    
+                    MCPLogger.log(TOOL_LOG_NAME, f"TLS wrapper created successfully (protocol: {tls_info.get('tls_version', 'unknown')})")
                 
                 MCPLogger.log(TOOL_LOG_NAME, f"TCP transport created successfully for {host}:{port}")
             
@@ -8134,7 +8793,21 @@ def handle_open_session(params: Dict) -> Dict:
                     "port": connection_params["port"],
                     "connect_timeout": connect_timeout,
                 })
-                result["message"] = f"Session {session_id} opened successfully. TCP transport active, worker thread running."
+                
+                # Phase 6A: Add TLS info if enabled
+                if session.metadata.tls_enabled:
+                    tls_info = session.transport.get_tls_info()
+                    result.update({
+                        "tls_enabled": True,
+                        "tls_version": tls_info.get("tls_version", "unknown"),
+                        "tls_cipher": tls_info.get("cipher", "unknown"),
+                        "tls_verified": tls_info.get("verified", False),
+                        "tls_cert_subject": session.metadata.tls_cert_subject,
+                        "tls_cert_fingerprint": session.metadata.tls_cert_fingerprint,
+                    })
+                    result["message"] = f"Session {session_id} opened successfully. TCP transport active with TLS encryption ({tls_info.get('tls_version', 'unknown')}), worker thread running."
+                else:
+                    result["message"] = f"Session {session_id} opened successfully. TCP transport active, worker thread running."
             
             elif transport_type == "telnet":
                 # Add Telnet-specific info (Phase 5B)
@@ -9422,6 +10095,173 @@ def handle_get_line_states(params: Dict) -> Dict:
         return create_error_response(f"Error in get_line_states: {str(e)}", with_readme=False)
 
 # ============================================================================
+# PHASE 6A: TLS/SSL HANDLERS
+# ============================================================================
+
+def handle_upgrade_to_tls(params: Dict) -> Dict:
+    """Handle upgrade_to_tls operation - Upgrade existing connection to TLS (STARTTLS).
+    
+    This operation wraps the current transport with TLS encryption.
+    Use this after negotiating STARTTLS with the server (e.g., SMTP, IMAP).
+    
+    Example flow:
+        1. open_session with plain TCP
+        2. send_data "STARTTLS\\r\\n"
+        3. read_data (wait for "220 Ready")
+        4. upgrade_to_tls
+        5. Continue with encrypted connection
+    """
+    try:
+        session_id = params.get("session_id")
+        
+        if not session_id:
+            return create_error_response("Parameter 'session_id' is required for upgrade_to_tls", with_readme=False)
+        
+        session = get_session(session_id)
+        if not session:
+            return create_error_response(f"Session {session_id} not found", with_readme=False)
+        
+        if not session.transport:
+            return create_error_response(f"Session {session_id} has no active transport", with_readme=False)
+        
+        # Check if already using TLS
+        if session.metadata.tls_enabled:
+            return create_error_response(f"Session {session_id} is already using TLS", with_readme=False)
+        
+        # Get TLS parameters
+        tls_verify = params.get("tls_verify", True)
+        tls_server_hostname = params.get("tls_server_hostname")
+        
+        # Extract hostname from connection params if not provided
+        if not tls_server_hostname:
+            if "host" in session.connection_params:
+                tls_server_hostname = session.connection_params["host"]
+            else:
+                return create_error_response("Cannot determine server hostname for TLS. Please provide tls_server_hostname parameter.", with_readme=False)
+        
+        MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id}: Upgrading to TLS (verify={tls_verify}, hostname={tls_server_hostname})")
+        
+        try:
+            # Wrap current transport with TLS
+            old_transport = session.transport
+            session.transport = TLSWrapper(
+                old_transport,
+                verify_cert=tls_verify,
+                server_hostname=tls_server_hostname
+            )
+            
+            # Update metadata
+            session.metadata.tls_enabled = True
+            tls_info = session.transport.get_tls_info()
+            session.metadata.tls_cert_fingerprint = tls_info.get("fingerprint_sha256", "")
+            subject = tls_info.get("subject", {})
+            session.metadata.tls_cert_subject = subject.get("commonName", "") if isinstance(subject, dict) else ""
+            
+            # Update connection params for auto-reconnect
+            session.connection_params["use_tls"] = True
+            session.connection_params["tls_verify"] = tls_verify
+            session.connection_params["tls_server_hostname"] = tls_server_hostname
+            
+            MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id}: TLS upgrade successful (protocol: {tls_info.get('tls_version', 'unknown')})")
+            
+            result = {
+                "success": True,
+                "session_id": session_id,
+                "tls_enabled": True,
+                "tls_version": tls_info.get("tls_version", "unknown"),
+                "tls_cipher": tls_info.get("cipher", "unknown"),
+                "tls_verified": tls_info.get("verified", False),
+                "tls_cert_subject": session.metadata.tls_cert_subject,
+                "tls_cert_fingerprint": session.metadata.tls_cert_fingerprint,
+                "message": f"Session upgraded to TLS successfully ({tls_info.get('tls_version', 'unknown')})"
+            }
+            
+            return {
+                "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                "isError": False
+            }
+            
+        except Exception as e:
+            MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id}: TLS upgrade failed: {e}")
+            return create_error_response(f"TLS upgrade failed: {str(e)}", with_readme=False)
+        
+    except Exception as e:
+        return create_error_response(f"Error in upgrade_to_tls: {str(e)}", with_readme=False)
+
+
+def handle_get_tls_info(params: Dict) -> Dict:
+    """Handle get_tls_info operation - Get TLS connection and certificate information.
+    
+    Returns detailed information about the TLS connection including:
+    - TLS protocol version
+    - Cipher suite
+    - Server certificate details
+    - Certificate fingerprint
+    - Verification status
+    """
+    try:
+        session_id = params.get("session_id")
+        
+        if not session_id:
+            return create_error_response("Parameter 'session_id' is required for get_tls_info", with_readme=False)
+        
+        session = get_session(session_id)
+        if not session:
+            return create_error_response(f"Session {session_id} not found", with_readme=False)
+        
+        if not session.transport:
+            return create_error_response(f"Session {session_id} has no active transport", with_readme=False)
+        
+        # Check if TLS is enabled
+        if not session.metadata.tls_enabled:
+            result = {
+                "success": True,
+                "session_id": session_id,
+                "tls_enabled": False,
+                "message": "TLS is not enabled on this session"
+            }
+            
+            return {
+                "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                "isError": False
+            }
+        
+        # Get TLS info from transport
+        try:
+            tls_info = session.transport.get_tls_info()
+            
+            result = {
+                "success": True,
+                "session_id": session_id,
+                "tls_enabled": True,
+                "tls_version": tls_info.get("tls_version", "unknown"),
+                "cipher": tls_info.get("cipher", "unknown"),
+                "cipher_bits": tls_info.get("cipher_bits", 0),
+                "certificate": {
+                    "subject": tls_info.get("subject", {}),
+                    "issuer": tls_info.get("issuer", {}),
+                    "not_before": tls_info.get("not_before", ""),
+                    "not_after": tls_info.get("not_after", ""),
+                    "serial_number": tls_info.get("serial_number", ""),
+                    "fingerprint_sha256": tls_info.get("fingerprint_sha256", ""),
+                    "san": tls_info.get("san", [])
+                },
+                "verified": tls_info.get("verified", False)
+            }
+            
+            return {
+                "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+                "isError": False
+            }
+            
+        except Exception as e:
+            return create_error_response(f"Failed to get TLS info: {str(e)}", with_readme=False)
+        
+    except Exception as e:
+        return create_error_response(f"Error in get_tls_info: {str(e)}", with_readme=False)
+
+
+# ============================================================================
 # PHASE 5M: SFTP FILE TRANSFER HANDLERS
 # ============================================================================
 
@@ -9974,6 +10814,12 @@ def handle_terminal(input_param: Dict) -> Dict:
             return handle_sftp_get(validated_params)
         elif operation == "sftp_list":
             return handle_sftp_list(validated_params)
+        
+        # Phase 6A: TLS/SSL operations
+        elif operation == "upgrade_to_tls":
+            return handle_upgrade_to_tls(validated_params)
+        elif operation == "get_tls_info":
+            return handle_get_tls_info(validated_params)
         
         elif operation == "readme":
             return {
