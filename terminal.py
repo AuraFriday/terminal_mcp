@@ -10,8 +10,8 @@ Supports physical serial ports and network transports (TCP, telnet, RFC2217).
 Copyright: © 2025 Christopher Nathan Drake. All rights reserved.
 SPDX-License-Identifier: Proprietary
 
-"signature": "еģ9МցꙅAƐAµᎬꓠꓗτᴅycıᴡȷВցⲞ𝟢ΡKIQģɯоdsÞΑyеԛƶᎠBոԁiТꓟnω𝟙𝟫օ𝛢ƍƛģA𝟫𐓒ꓐТᗪνȣɋrɅƊĵСꓬᎪՕıGуkꜱᴍ𐓒Јԁꓮ𝟩R𝟑H𝟤ꓪЈıꓜƋQwȜɯꓟTоʌѵᎪꓬᒿᴠωƋEꙅ"
-"signdate": "2026-01-07T23:30:26.008Z",
+"signature": "bѡƟΥyĸꜱųLⅮƻОÐ𝟩SᏟᏎaꓖ𝟚ꓗƍƊŪƟꓠXĐхⲞƊFvDҳϨ𝟤ҳs𝟨ȣΤꓑrꓓⲞƼЗꓑꓰhƍᖴlυⅠᗞΝꓟ𝟨ꓮꙄBһՕɡКNnԁᒿτОꓧꓪΒph𐐕tNꓴTѵcɪꓮȷ𝟫ⲘᎬɡďКɡуƧwĐvⲟRωⅮⲔ2ᗷꙅģ"
+"signdate": "2026-01-19T06:46:56.560Z",
 """
 
 import json
@@ -3578,8 +3578,11 @@ class ProgramTransport(BaseTransport):
         self.elevated_listener.listen(1)
         self.elevated_listener.settimeout(30.0)  # 30 second timeout for bridge to connect
         
-        # Generate authentication token
-        self.bridge_token = secrets.token_urlsafe(32)
+        # Generate authentication token (alphanumeric only for shell safety)
+        # 48 chars of [a-zA-Z0-9] = ~285 bits of entropy (very secure)
+        import string
+        alphabet = string.ascii_letters + string.digits
+        self.bridge_token = ''.join(secrets.choice(alphabet) for _ in range(48))
         
         # Find bridge script using SharedConfigManager (handles .app bundles on macOS)
         from ragtag.shared_config import SharedConfigManager
@@ -3642,38 +3645,91 @@ class ProgramTransport(BaseTransport):
             raise TransportError(f"Bridge authentication failed: {e}")
     
     def _launch_bridge_windows(self, bridge_script, bridge_args):
-        """Launch bridge on Windows with UAC prompt."""
-        import subprocess
-        import shlex
+        """Launch bridge on Windows with UAC prompt using ShellExecuteEx.
+        
+        We use ShellExecuteEx with 'runas' verb directly instead of PowerShell because:
+        1. It shows only the UAC prompt, no intermediate PowerShell window
+        2. It's the same API that Windows Sudo uses internally
+        3. SW_HIDE hides the elevated process window after UAC approval
+        """
+        import ctypes
+        from ctypes import wintypes
         import sys
         
-        # Use PowerShell to launch elevated process with UAC
-        # Start-Process -Verb RunAs triggers UAC prompt
-        # Find aura.exe in same directory as bridge script
+        # NOTE: We must use python.exe (not aura.exe/pythonw.exe) because:
+        # - winpty requires a console subsystem to work properly
+        # - pythonw.exe is a GUI subsystem app without console, causing winpty to fail
         bridge_dir = os.path.dirname(bridge_script)
+        
+        # Use python.exe (console Python) - required for winpty to work
         python_exe = os.path.join(bridge_dir, "python.exe")
         if not os.path.exists(python_exe):
             # Fallback to sys.executable (development)
             python_exe = sys.executable
-        args_str = ' '.join(f'"{arg}"' if ' ' in arg else arg for arg in bridge_args)
         
-        # Don't hide window during testing/debugging - user needs to see errors!
-        # Note: Window will close automatically once bridge connects or fails
-        ps_command = f'Start-Process -FilePath "{python_exe}" -ArgumentList \'"{bridge_script}",{args_str}\' -Verb RunAs'
+        # Build argument string: script path followed by all arguments, space-separated
+        all_args = [bridge_script] + bridge_args
+        args_str = ' '.join(all_args)
         
-        MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Launching Windows bridge via UAC...")
+        MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Launching Windows bridge via ShellExecuteEx (UAC)...")
         MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Python: {python_exe}")
         MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Bridge: {bridge_script}")
         MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Args: {bridge_args}")
         
         try:
-            subprocess.Popen(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_command],
-                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-            )
-            MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] PowerShell launch command executed (waiting for UAC approval)")
+            # Use ShellExecuteEx with 'runas' verb for UAC elevation
+            # This is the same approach Windows Sudo uses internally
+            
+            # Define SHELLEXECUTEINFOW structure
+            class SHELLEXECUTEINFOW(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("fMask", wintypes.ULONG),
+                    ("hwnd", wintypes.HWND),
+                    ("lpVerb", wintypes.LPCWSTR),
+                    ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int),
+                    ("hInstApp", wintypes.HINSTANCE),
+                    ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", wintypes.LPCWSTR),
+                    ("hkeyClass", wintypes.HKEY),
+                    ("dwHotKey", wintypes.DWORD),
+                    ("hIconOrMonitor", wintypes.HANDLE),
+                    ("hProcess", wintypes.HANDLE),
+                ]
+            
+            # Constants
+            SEE_MASK_NOCLOSEPROCESS = 0x00000040
+            SW_HIDE = 0
+            SW_SHOWNORMAL = 1
+            
+            # Get current working directory
+            cwd = os.getcwd()
+            
+            # Set up the structure
+            sei = SHELLEXECUTEINFOW()
+            sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+            sei.fMask = SEE_MASK_NOCLOSEPROCESS
+            sei.hwnd = None
+            sei.lpVerb = "runas"  # This triggers UAC
+            sei.lpFile = python_exe
+            sei.lpParameters = args_str
+            sei.lpDirectory = cwd
+            sei.nShow = SW_HIDE  # Hide the window after UAC approval
+            sei.hInstApp = None
+            
+            # Call ShellExecuteExW
+            shell32 = ctypes.windll.shell32
+            if not shell32.ShellExecuteExW(ctypes.byref(sei)):
+                error_code = ctypes.get_last_error()
+                raise OSError(f"ShellExecuteExW failed with error code {error_code}")
+            
+            MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] ShellExecuteEx succeeded (waiting for UAC approval)")
+            
         except Exception as e:
-            MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] ERROR launching PowerShell: {e}")
+            MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] ERROR launching via ShellExecuteEx: {e}")
             raise
     
     def _launch_bridge_linux(self, bridge_script, bridge_args):
