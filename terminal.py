@@ -10,8 +10,8 @@ Supports physical serial ports and network transports (TCP, telnet, RFC2217).
 Copyright: © 2025 Christopher Nathan Drake. All rights reserved.
 SPDX-License-Identifier: Proprietary
 
-"signature": "bѡƟΥyĸꜱųLⅮƻОÐ𝟩SᏟᏎaꓖ𝟚ꓗƍƊŪƟꓠXĐхⲞƊFvDҳϨ𝟤ҳs𝟨ȣΤꓑrꓓⲞƼЗꓑꓰhƍᖴlυⅠᗞΝꓟ𝟨ꓮꙄBһՕɡКNnԁᒿτОꓧꓪΒph𐐕tNꓴTѵcɪꓮȷ𝟫ⲘᎬɡďКɡуƧwĐvⲟRωⅮⲔ2ᗷꙅģ"
-"signdate": "2026-01-19T06:46:56.560Z",
+"signature": "ꓐսꞇNyꙅꓴꓗ4ɅОnIеÐᗷᏮhƐƶďτꓐÐXzᗷ𝟙ӠАοᏮX𝕌ꞇοᎪΡᎻ𐓒ƛj𝟥𝖠𝖠һcþƍΡꓟɌJЈɊⲞȜϜHց𝟣Νj𝟫QıТΤр3ᴡnƻμЗMʈᛕꓴɅg3ᗪ𝟙ⅼꓣꓗKzхL7бbʌᎠѵƘ𝕌ʋНᑕᎻᗅꙄᑕꓣƲᴅ"
+"signdate": "2026-02-10T18:18:47.344Z",
 """
 
 import json
@@ -7664,7 +7664,7 @@ Returns: session_id, log_file_path, transport_type, and connection status
 ```
 
 ### send_data
-Send data to an open session's serial port.
+Send data to an open session.
 
 Parameters:
 - session_id (required): Session to send data to
@@ -7675,12 +7675,48 @@ Examples:
 - Send Ctrl-C (enter REPL): data="^C"
 - REPL command (note {BS}r{BS}n!): data="2+2{BS}r{BS}n"
 - Import statement: data="import sys{BS}r{BS}n"
-- Multi-line command: data="x = [1,2,3]{BS}r{BS}nsum(x){BS}r{BS}n"
+- Sequential commands: data="x = [1,2,3]{BS}r{BS}nsum(x){BS}r{BS}n"
 - Send raw hex: raw_bytes="03 04 05"
 
 **TIP:** MicroPython REPL needs {BS}r{BS}n (CRLF), not just {BS}n (LF)
 
 Returns: bytes_sent confirmation
+
+### CRITICAL: Escaping and Multi-Line Content
+
+**Escape processing:** The data field supports these escape sequences:
+{BS}r (CR), {BS}n (LF), {BS}t (TAB), {BS}xNN (hex byte), {BS}uNNNN (Unicode), {BS}{BS} (literal backslash), {BS}^ (literal caret), ^C/^D/etc (control chars).
+
+**JSON double-escaping:** Since your tool call is JSON, backslashes need double-escaping.
+Write `{BS}{BS}r{BS}{BS}n` in your JSON string to get `{BS}r{BS}n` after JSON parsing, which our parser then converts to CR+LF.
+Writing a plain JSON `{BS}n` also works (JSON makes it a real newline byte, sent as-is), but
+every newline acts as pressing Enter in a terminal - see multi-line warning below.
+
+**Sending multi-line content (scripts, config files, etc.):**
+Every {BS}r{BS}n sent to a terminal acts as pressing Enter. If you send a multi-line bash script
+or Python function, each line executes independently as a separate command, causing syntax errors.
+
+Solutions (best to worst):
+
+1. **sftp_put** (SSH sessions - BEST for scripts/files):
+   Write content to a local temp file, then upload via SFTP and execute:
+   sftp_put local_path="/tmp/myscript.py" remote_path="/tmp/myscript.py"
+   send_data data="python3 /tmp/myscript.py{BS}r{BS}n"
+
+2. **heredoc** (bash/sh sessions):
+   Shell collects lines until delimiter without executing them:
+   data="cat > /tmp/script.sh << 'EOF'{BS}r{BS}nline1{BS}r{BS}nline2{BS}r{BS}nEOF{BS}r{BS}n"
+
+3. **base64** (any session with base64 command):
+   data="echo 'BASE64STRING' | base64 -d > /tmp/script.sh{BS}r{BS}n"
+
+4. **printf** (any POSIX shell):
+   data="printf 'line1{BS}{BS}nline2{BS}{BS}nline3' > /tmp/file.txt{BS}r{BS}n"
+   (The {BS}{BS}n inside printf's quotes is a printf escape for newline, not Enter)
+
+5. **Line-by-line** (interactive REPLs only):
+   Send each line with {BS}r{BS}n and let the REPL prompt for more.
+   For MicroPython, use paste mode (^E) to enter multi-line blocks.
 
 ### read_data
 Read data from session (waits for timeout or max_bytes or idle timeout).
