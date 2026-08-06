@@ -10,20 +10,21 @@ Supports physical serial ports and network transports (TCP, telnet, RFC2217).
 Copyright: © 2025 Christopher Nathan Drake. All rights reserved.
 SPDX-License-Identifier: Proprietary
 
-"signature": "ꓐսꞇNyꙅꓴꓗ4ɅОnIеÐᗷᏮhƐƶďτꓐÐXzᗷ𝟙ӠАοᏮX𝕌ꞇοᎪΡᎻ𐓒ƛj𝟥𝖠𝖠һcþƍΡꓟɌJЈɊⲞȜϜHց𝟣Νj𝟫QıТΤр3ᴡnƻμЗMʈᛕꓴɅg3ᗪ𝟙ⅼꓣꓗKzхL7бbʌᎠѵƘ𝕌ʋНᑕᎻᗅꙄᑕꓣƲᴅ"
-"signdate": "2026-02-10T18:18:47.344Z",
+"signature": "Ꮒ𝟦ʋАꓐkʋ6𝟙ꓖ𝐴WυցМрAᏂĸօNμ7Υ×ƽ𝟧ȠКɡ1ոКбᴡᏎΡƨЈ4Uꓚⲟß𝖠iᎬɌꓰ𝟤Ϲ𝟛Ƴƻ1Đ𝟦ⅼМΝᴜKꓴpbМTʌᴡjƶօбꓬᎬᎻꓖᎠHsҳꓴP𝘈ɊꓧᴅXTхĐоϨȜƧеАƛᴛÐqƿTΟųʈƦpⅠ"
+"signdate": "2026-07-29T09:30:24.630Z",
 """
 
 import json
 import os
+import atexit
 import threading
 import time
 import queue
 import re
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple, Union, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 from easy_mcp.server import MCPLogger, get_tool_token
 from ragtag.shared_config import get_user_data_directory
 
@@ -39,9 +40,24 @@ _bleak = None
 
 # Constants
 TOOL_LOG_NAME = "TERMINAL"
-VERSION = "1.11.2-phase6a-tls-ipv6"  # Phase 6A: TLS/SSL support + Full IPv6 support (parsing + connection)
 
-# Module-level token generated once at import time
+# Resource limits (protect against runaway memory / fd / thread exhaustion by a
+# confused or prompt-injected AI - review A8/A14/A15/C5)
+MAX_ACTIVE_SESSIONS = 50               # Cap simultaneous open sessions (threads/fds/log handles)
+MAX_OUTPUT_QUEUE_ITEMS = 4096          # Bound per-session output backlog; oldest dropped on overflow
+MAX_READ_TIMEOUT_SECONDS = 240.0       # Keep read/wait below the ~270s server tool timeout
+MAX_DISCOVERY_DURATION_SECONDS = 60.0  # Cap mDNS / Bluetooth scan durations
+MAX_LOG_FILE_BYTES = 50 * 1024 * 1024  # Rotate the per-session log once it reaches this size
+
+# tool_unlock_token = a COMPREHENSION GATE, NOT authentication and NOT a secret: it only proves
+# the caller has read THIS tool's readme before acting, and the readme hands it out FREELY.
+# get_tool_token(__file__) derives it from this file's own bytes, so it ROTATES whenever this
+# tool's code changes -- deliberately, to force AIs to re-read after an update. Invariants (see
+# doc/50_non-AI-calling-and-how-to-get-unlock-tokens.md): this tool OWNS its token -- never mint
+# or embed another tool's token, never accept a token supplied at registration; reveal it ONLY
+# via readme (readme needs no token); on a wrong/missing token RETURN the readme rather than
+# failing as "unauthorized"; the inter-tool form "-<caller>-<target>" (mcp_bridge.py) is a
+# non-AI convenience, NOT a security boundary.
 TOOL_UNLOCK_TOKEN = get_tool_token(__file__)
 
 # Tool name with optional suffix from environment variable
@@ -73,32 +89,15 @@ def ensure_pyserial():
             _serial = serial
             _serial_tools_list_ports = serial.tools.list_ports
             MCPLogger.log(TOOL_LOG_NAME, f"pyserial {serial.__version__} loaded successfully")
-        except ImportError:
-            # Auto-install pyserial if not present
-            MCPLogger.log(TOOL_LOG_NAME, "pyserial not found, attempting auto-installation...")
-            try:
-                import pip
-                MCPLogger.log(TOOL_LOG_NAME, "Installing pyserial (this may take a minute)...")
-                result = pip.main(['install', 'pyserial'])
-                
-                if result != 0:
-                    raise RuntimeError(f"pip failed with exit code {result}")
-                
-                # Import after installation
-                import serial
-                import serial.tools.list_ports
-                _serial = serial
-                _serial_tools_list_ports = serial.tools.list_ports
-                MCPLogger.log(TOOL_LOG_NAME, f"pyserial {serial.__version__} installed successfully")
-                
-            except Exception as e:
-                error_msg = f"""Failed to auto-install pyserial: {str(e)}
-
-Please install manually with:
-pip install pyserial
-
-This library is required for serial port communication with MCUs."""
-                raise RuntimeError(error_msg)
+        except ImportError as e:
+            # Do NOT install at runtime: this ships as a fully-isolated bundled
+            # runtime, so pyserial must be bundled. Fail with a clear message
+            # instead of a live pip install (review A7/C6).
+            raise RuntimeError(
+                "pyserial is required for serial-port communication but is not available "
+                "in this runtime. It should be bundled with the server; please reinstall "
+                "the application (developers: pip install pyserial)."
+            ) from e
     
     return _serial, _serial_tools_list_ports
 
@@ -118,30 +117,13 @@ def ensure_paramiko():
             import paramiko
             _paramiko = paramiko
             MCPLogger.log(TOOL_LOG_NAME, f"paramiko {paramiko.__version__} loaded successfully")
-        except ImportError:
-            # Auto-install paramiko if not present
-            MCPLogger.log(TOOL_LOG_NAME, "paramiko not found, attempting auto-installation...")
-            try:
-                import pip
-                MCPLogger.log(TOOL_LOG_NAME, "Installing paramiko (this may take a minute)...")
-                result = pip.main(['install', 'paramiko'])
-                
-                if result != 0:
-                    raise RuntimeError(f"pip failed with exit code {result}")
-                
-                # Import after installation
-                import paramiko
-                _paramiko = paramiko
-                MCPLogger.log(TOOL_LOG_NAME, f"paramiko {paramiko.__version__} installed successfully")
-                
-            except Exception as e:
-                error_msg = f"""Failed to auto-install paramiko: {str(e)}
-
-Please install manually with:
-pip install paramiko
-
-This library is required for SSH transport support."""
-                raise RuntimeError(error_msg)
+        except ImportError as e:
+            # No runtime pip install in the bundled runtime (review A7/C6).
+            raise RuntimeError(
+                "paramiko is required for SSH transport but is not available in this runtime. "
+                "It should be bundled with the server; please reinstall the application "
+                "(developers: pip install paramiko)."
+            ) from e
     
     return _paramiko
 
@@ -167,25 +149,10 @@ def ensure_pyotp():
             _pyotp = pyotp
             MCPLogger.log(TOOL_LOG_NAME, f"pyotp {pyotp.__version__} loaded successfully")
         except ImportError:
-            # Auto-install pyotp if not present
-            MCPLogger.log(TOOL_LOG_NAME, "pyotp not found, attempting auto-installation...")
-            try:
-                import pip
-                MCPLogger.log(TOOL_LOG_NAME, "Installing pyotp (for TOTP 2FA support)...")
-                result = pip.main(['install', 'pyotp'])
-                
-                if result != 0:
-                    MCPLogger.log(TOOL_LOG_NAME, f"pip failed with exit code {result} (pyotp optional, continuing)")
-                    return None
-                
-                # Import after installation
-                import pyotp
-                _pyotp = pyotp
-                MCPLogger.log(TOOL_LOG_NAME, f"pyotp {pyotp.__version__} installed successfully")
-                
-            except Exception as e:
-                MCPLogger.log(TOOL_LOG_NAME, f"Failed to auto-install pyotp: {e} (optional, continuing)")
-                return None
+            # pyotp is optional (only needed for SSH TOTP 2FA). No runtime install
+            # in the bundled runtime; degrade gracefully (review A7/C6).
+            MCPLogger.log(TOOL_LOG_NAME, "pyotp not available - SSH TOTP 2FA disabled (bundle pyotp to enable)")
+            return None
     
     return _pyotp
 
@@ -209,7 +176,6 @@ def ensure_pywinpty():
         - Linux/macOS: Not needed (uses built-in pty module)
     """
     import sys
-    import subprocess
     
     # Only needed on Windows
     if sys.platform != 'win32':
@@ -222,43 +188,15 @@ def ensure_pywinpty():
             import winpty  # Package is 'pywinpty', module is 'winpty'
             _pywinpty = winpty
             MCPLogger.log(TOOL_LOG_NAME, f"winpty (from pywinpty package) loaded successfully")
-        except ImportError:
-            # Auto-install pywinpty if not present
-            MCPLogger.log(TOOL_LOG_NAME, "pywinpty not found, attempting auto-installation...")
-            try:
-                MCPLogger.log(TOOL_LOG_NAME, "Installing pywinpty (this may take a minute)...")
-                result = subprocess.run([sys.executable, '-m', 'pip', 'install', 'pywinpty'], 
-                                      capture_output=True, text=True,
-                                      creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0)
-                
-                MCPLogger.log(TOOL_LOG_NAME, f"pip install stdout: {result.stdout}")
-                MCPLogger.log(TOOL_LOG_NAME, f"pip install stderr: {result.stderr}")
-                
-                if result.returncode != 0:
-                    raise RuntimeError(f"pip failed with exit code {result.returncode}: {result.stderr}")
-                
-                # Import after installation using importlib (works better for dynamic imports)
-                # Note: Package is 'pywinpty', module is 'winpty'
-                try:
-                    import importlib
-                    _pywinpty = importlib.import_module('winpty')
-                    MCPLogger.log(TOOL_LOG_NAME, f"winpty (from pywinpty package) installed and imported successfully")
-                except ImportError as import_err:
-                    # Installation succeeded but import failed - likely need to restart Python process
-                    raise RuntimeError(f"pywinpty was installed successfully, but cannot be imported in the current Python process. Please restart the MCP server to use program:// endpoints. Error: {import_err}")
-                
-            except Exception as e:
-                error_msg = f"""Failed to auto-install pywinpty: {str(e)}
-
-Please install manually with:
-pip install pywinpty
-
-This library is required for spawning programs with PTY support on Windows (Phase 5E).
-
-Platform Requirements:
-- Windows: pywinpty provides ConPTY (Windows Pseudo Console) support
-- Linux/macOS: Uses built-in pty module (no additional dependencies)"""
-                raise RuntimeError(error_msg)
+        except ImportError as e:
+            # No runtime pip install in the bundled runtime (review A2/A7/C6).
+            # (The old auto-install path also referenced an unimported `platform`,
+            # raising NameError instead of installing.)
+            raise RuntimeError(
+                "pywinpty is required for spawning programs with a PTY on Windows (program:// "
+                "transport) but is not available in this runtime. It should be bundled with the "
+                "server; please reinstall the application (developers: pip install pywinpty)."
+            ) from e
     
     return _pywinpty
 
@@ -286,35 +224,13 @@ def ensure_zeroconf():
             import zeroconf
             _zeroconf = zeroconf
             MCPLogger.log(TOOL_LOG_NAME, f"zeroconf {zeroconf.__version__} loaded successfully")
-        except ImportError:
-            # Auto-install zeroconf if not present
-            MCPLogger.log(TOOL_LOG_NAME, "zeroconf not found, attempting auto-installation...")
-            try:
-                import pip
-                MCPLogger.log(TOOL_LOG_NAME, "Installing zeroconf (this may take a minute)...")
-                result = pip.main(['install', 'zeroconf'])
-                
-                if result != 0:
-                    raise RuntimeError(f"pip failed with exit code {result}")
-                
-                # Import after installation
-                import zeroconf
-                _zeroconf = zeroconf
-                MCPLogger.log(TOOL_LOG_NAME, f"zeroconf {zeroconf.__version__} installed successfully")
-                
-            except Exception as e:
-                error_msg = f"""Failed to auto-install zeroconf: {str(e)}
-
-Please install manually with:
-pip install zeroconf
-
-This library is required for network device discovery (mDNS/DNS-SD).
-
-Platform Requirements:
-- Windows: Install Bonjour service (comes with iTunes or standalone)
-- Linux/WSL: Built-in Avahi daemon support
-- macOS: Built-in mDNS support"""
-                raise RuntimeError(error_msg)
+        except ImportError as e:
+            # No runtime pip install in the bundled runtime (review A7/C6).
+            raise RuntimeError(
+                "zeroconf is required for network device discovery (mDNS/DNS-SD) but is not "
+                "available in this runtime. It should be bundled with the server; please "
+                "reinstall the application (developers: pip install zeroconf)."
+            ) from e
     
     return _zeroconf
 
@@ -385,35 +301,13 @@ def ensure_bleak():
             _bleak = bleak
             # bleak doesn't expose __version__ consistently, so just confirm it loaded
             MCPLogger.log(TOOL_LOG_NAME, f"bleak loaded successfully (BLE support enabled)")
-        except ImportError:
-            # Auto-install bleak if not present (pure Python, safe to auto-install)
-            MCPLogger.log(TOOL_LOG_NAME, "bleak not found, attempting auto-installation...")
-            try:
-                import pip
-                MCPLogger.log(TOOL_LOG_NAME, "Installing bleak (this may take a minute)...")
-                result = pip.main(['install', 'bleak'])
-                
-                if result != 0:
-                    raise RuntimeError(f"pip failed with exit code {result}")
-                
-                # Import after installation
-                import bleak
-                _bleak = bleak
-                MCPLogger.log(TOOL_LOG_NAME, f"bleak installed successfully")
-                
-            except Exception as e:
-                error_msg = f"""Failed to auto-install bleak: {str(e)}
-
-Please install manually with:
-pip install bleak
-
-This library is required for Bluetooth Low Energy (BLE/GATT) support.
-
-Platform Requirements:
-- Windows: Windows 10+ with built-in BLE support
-- Linux: bluez package with BLE support
-- macOS: Built-in BLE support"""
-                raise RuntimeError(error_msg)
+        except ImportError as e:
+            # No runtime pip install in the bundled runtime (review A7/C6).
+            raise RuntimeError(
+                "bleak is required for Bluetooth Low Energy (BLE/GATT) support but is not "
+                "available in this runtime. It should be bundled with the server; please "
+                "reinstall the application (developers: pip install bleak)."
+            ) from e
     
     return _bleak
 
@@ -1070,7 +964,9 @@ class TCPTransport(BaseTransport):
         Uses sendall() to handle partial sends internally.
         """
         try:
-            MCPLogger.log(TOOL_LOG_NAME, f"TCP send({len(data)} bytes): {data[:50].hex()}")
+            # Log length only - never payload bytes: plaintext tcp://\/telnet:// and
+            # pre-STARTTLS traffic can carry credentials (review B3)
+            MCPLogger.log(TOOL_LOG_NAME, f"TCP send({len(data)} bytes)")
             self.socket.sendall(data)
             return len(data)  # sendall() ensures all bytes sent or raises
         except Exception as e:
@@ -1085,7 +981,8 @@ class TCPTransport(BaseTransport):
         """
         try:
             data = self.socket.recv(size)
-            MCPLogger.log(TOOL_LOG_NAME, f"TCP recv({size}) → {len(data)} bytes: {data[:50].hex() if data else '(empty)'}")
+            # Log length only - never payload bytes (review B3)
+            MCPLogger.log(TOOL_LOG_NAME, f"TCP recv({size}) -> {len(data)} bytes")
             if data == b'':
                 # Proper EOF handling for TCP: empty recv() means peer closed connection
                 MCPLogger.log(TOOL_LOG_NAME, f"TCP EOF detected: recv() returned empty bytes → connection closed by peer")
@@ -1109,17 +1006,45 @@ class TCPTransport(BaseTransport):
             self.socket = None
     
     def is_open(self) -> bool:
-        """Check if TCP socket is still connected."""
+        """Check if TCP socket is still connected.
+
+        getpeername() alone does NOT detect a peer half-close (FIN); an idle
+        session would look alive until the next read. Additionally probe with
+        select() for an error condition and a zero-length MSG_PEEK to catch EOF
+        promptly (review D1). MSG_PEEK is skipped on SSL sockets (SSLSocket.recv
+        rejects flags); for TLS, EOF is still detected on the next read().
+        """
         if not self.socket:
             return False
         
         try:
-            # Try to peek at socket state (doesn't consume data)
-            # If socket is closed, this will raise
+            # If socket is closed, this raises
             self.socket.getpeername()
-            return True
-        except:
+        except Exception:
             return False
+        
+        try:
+            import select
+            import socket as _socket
+            import ssl as _ssl
+            readable, _, errored = select.select([self.socket], [], [self.socket], 0)
+            if errored:
+                return False
+            if readable and not isinstance(self.socket, _ssl.SSLSocket):
+                # Readable: could be data OR a FIN. Peek without consuming; an
+                # empty peek means the peer closed the connection (EOF).
+                try:
+                    if self.socket.recv(1, _socket.MSG_PEEK) == b'':
+                        return False
+                except BlockingIOError:
+                    pass
+                except Exception:
+                    return False
+        except Exception:
+            # Never let the liveness probe itself flip a healthy socket to closed
+            pass
+        
+        return True
     
     # ========================================================================
     # Serial control lines (NOT supported on TCP)
@@ -1656,11 +1581,14 @@ class RFC2217Transport(TelnetTransport):
         Returns:
             Dictionary with line state values
         """
+        # Keys MUST be upper-case (CTS/DSR/RI/CD) to match what the worker's
+        # get_line_states command reads; lower-case keys made every RFC2217 line
+        # state read back as False (review A4).
         return {
-            "cts": bool(self.modem_state & self.MODEMSTATE_CTS),
-            "dsr": bool(self.modem_state & self.MODEMSTATE_DSR),
-            "ri":  bool(self.modem_state & self.MODEMSTATE_RI),
-            "cd":  bool(self.modem_state & self.MODEMSTATE_CD),
+            "CTS": bool(self.modem_state & self.MODEMSTATE_CTS),
+            "DSR": bool(self.modem_state & self.MODEMSTATE_DSR),
+            "RI":  bool(self.modem_state & self.MODEMSTATE_RI),
+            "CD":  bool(self.modem_state & self.MODEMSTATE_CD),
             "dtr": self.dtr_state,
             "rts": self.rts_state,
         }
@@ -1764,13 +1692,15 @@ class WebSocketTransport(BaseTransport):
         
         MCPLogger.log(TOOL_LOG_NAME, f"[WebSocketTransport] Connecting to {url} (mode: {self.ws_mode})")
         
-        # Auto-install websocket-client if missing
+        # websocket-client must be bundled; no runtime pip install (review A7/C6)
         try:
             import websocket
-        except ImportError:
-            MCPLogger.log(TOOL_LOG_NAME, "[WebSocketTransport] websocket-client not found, attempting auto-install...")
-            self._auto_install_websocket()
-            import websocket
+        except ImportError as e:
+            raise TransportConnectionError(
+                "websocket-client is required for ws:// and wss:// transport but is not available "
+                "in this runtime. It should be bundled with the server; please reinstall the "
+                "application (developers: pip install websocket-client)."
+            ) from e
         
         try:
             # Create WebSocket connection
@@ -1795,44 +1725,6 @@ class WebSocketTransport(BaseTransport):
             error_msg = f"Unexpected error connecting to {url}: {e}"
             MCPLogger.log(TOOL_LOG_NAME, f"[WebSocketTransport] ERROR: {error_msg}")
             raise TransportConnectionError(error_msg) from e
-    
-    def _auto_install_websocket(self):
-        """Auto-install websocket-client library if missing."""
-        import subprocess
-        import sys
-        import platform
-        
-        MCPLogger.log(TOOL_LOG_NAME, "[WebSocketTransport] Auto-installing websocket-client...")
-        
-        try:
-            # Use subprocess.run (not deprecated pip.main)
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "websocket-client"],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
-            )
-            
-            if result.returncode == 0:
-                MCPLogger.log(TOOL_LOG_NAME, "[WebSocketTransport] websocket-client installed successfully!")
-                MCPLogger.log(TOOL_LOG_NAME, "[WebSocketTransport] NOTE: Server restart may be required for import to work")
-            else:
-                error_msg = f"Failed to install websocket-client: {result.stderr}"
-                MCPLogger.log(TOOL_LOG_NAME, f"[WebSocketTransport] ERROR: {error_msg}")
-                raise TransportConnectionError(
-                    f"websocket-client library not found and auto-install failed. "
-                    f"Please install manually: pip install websocket-client"
-                )
-        except subprocess.TimeoutExpired:
-            raise TransportConnectionError(
-                "websocket-client installation timed out. Please install manually: pip install websocket-client"
-            )
-        except Exception as e:
-            raise TransportConnectionError(
-                f"Failed to auto-install websocket-client: {e}. "
-                f"Please install manually: pip install websocket-client"
-            )
     
     def write(self, data: bytes) -> int:
         """Write data to WebSocket connection.
@@ -2118,13 +2010,17 @@ class TLSWrapper(BaseTransport):
         if hasattr(transport, 'socket') and transport.socket is not None:
             return transport.socket
         
-        # TelnetTransport: wraps TCPTransport via .tcp attribute
-        if hasattr(transport, 'tcp') and hasattr(transport.tcp, 'socket'):
+        # TelnetTransport / RFC2217Transport: wrap TCPTransport via .tcp attribute
+        if hasattr(transport, 'tcp') and getattr(transport.tcp, 'socket', None) is not None:
             return transport.tcp.socket
         
-        # UnixSocketTransport: has .socket attribute
-        # NamedPipeTransport: has .socket attribute (on Windows, named pipes use sockets)
-        # SerialTransport: does NOT have socket (uses pyserial)
+        # UnixSocketTransport: exposes the socket as .sock (NOT .socket) - review D6
+        if hasattr(transport, 'sock') and transport.sock is not None:
+            return transport.sock
+        
+        # NamedPipeTransport uses a Windows pipe handle / POSIX fd, NOT a socket, so
+        # ssl.wrap_socket() cannot wrap it (named pipes are excluded from TLS support).
+        # SerialTransport: does NOT have a socket (uses pyserial).
         
         # If we can't extract socket, return None
         return None
@@ -2146,13 +2042,15 @@ class TLSWrapper(BaseTransport):
             MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Updating {transport.__class__.__name__}.socket to SSL socket")
             transport.socket = ssl_socket
         
-        # TelnetTransport: update wrapped TCP's socket
+        # TelnetTransport / RFC2217Transport: update wrapped TCP's socket
         if hasattr(transport, 'tcp') and hasattr(transport.tcp, 'socket'):
             MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Updating {transport.tcp.__class__.__name__}.socket (via Telnet wrapper) to SSL socket")
             transport.tcp.socket = ssl_socket
         
-        # UnixSocketTransport, NamedPipeTransport: also have .socket attribute
-        # The above hasattr check handles them
+        # UnixSocketTransport: socket lives on .sock (NOT .socket) - review D6
+        if hasattr(transport, 'sock'):
+            MCPLogger.log(TOOL_LOG_NAME, f"[TLSWrapper] Updating {transport.__class__.__name__}.sock to SSL socket")
+            transport.sock = ssl_socket
     
     def _extract_certificate_info(self):
         """Extract certificate information from SSL socket for inspection."""
@@ -2597,7 +2495,7 @@ class BLETransport(BaseTransport):
         """
         super().__init__()
         
-        # Ensure bleak is available (auto-install if missing)
+        # Ensure bleak is available (bundled; raises a clear error if missing)
         bleak = ensure_bleak()
         
         self.address = address
@@ -2617,24 +2515,56 @@ class BLETransport(BaseTransport):
         
         MCPLogger.log(TOOL_LOG_NAME, f"[BLETransport] Connecting to {address} (mode: {ble_mode})...")
         
+        # A5 fix: bleak's BleakClient and its start_notify callbacks are bound to a
+        # single asyncio loop that must keep running for notifications to fire and
+        # for later write/close calls (which happen on the worker thread). Run a
+        # dedicated loop in its own thread and marshal every coroutine onto it via
+        # run_coroutine_threadsafe, instead of the old per-thread get_event_loop()
+        # pattern that never kept the loop running and used a different thread's loop.
+        import asyncio
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._run_event_loop,
+            name=f"BLE_Loop_{address}",
+            daemon=True
+        )
+        self._loop_thread.start()
+        
         try:
-            import asyncio
-            
-            # Run async connection in sync context
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            try:
-                loop.run_until_complete(self._async_connect())
-            finally:
-                # Keep loop running for async operations
-                pass
-            
+            future = asyncio.run_coroutine_threadsafe(self._async_connect(), self._loop)
+            future.result(timeout=timeout + 5.0)
             MCPLogger.log(TOOL_LOG_NAME, f"[BLETransport] Connected successfully to {address}")
-            
         except Exception as e:
             MCPLogger.log(TOOL_LOG_NAME, f"[BLETransport] Connection failed: {e}")
+            self._stop_event_loop()
             raise TransportConnectionError(f"Failed to connect to BLE device {address}: {e}")
+    
+    def _run_event_loop(self):
+        """Run the dedicated asyncio loop for this BLE client (own thread)."""
+        import asyncio
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+    
+    def _stop_event_loop(self):
+        """Stop and dispose the dedicated asyncio loop (idempotent)."""
+        loop = getattr(self, "_loop", None)
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+        thread = getattr(self, "_loop_thread", None)
+        if thread is not None:
+            try:
+                thread.join(timeout=5.0)
+            except Exception:
+                pass
+        try:
+            loop.close()
+        except Exception:
+            pass
+        self._loop = None
     
     async def _async_connect(self):
         """Async connection logic (runs in event loop)."""
@@ -2695,9 +2625,9 @@ class BLETransport(BaseTransport):
         try:
             import asyncio
             
-            # Run async write in event loop
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(self._async_write(data))
+            # Marshal the write onto the client's own event loop thread (A5 fix)
+            future = asyncio.run_coroutine_threadsafe(self._async_write(data), self._loop)
+            future.result(timeout=self.timeout + 5.0)
             
             return len(data)
             
@@ -2742,15 +2672,17 @@ class BLETransport(BaseTransport):
                 
                 import asyncio
                 
-                # Run async disconnect
-                loop = asyncio.get_event_loop()
-                loop.run_until_complete(self.client.disconnect())
+                # Marshal disconnect onto the client's own event loop thread (A5 fix)
+                future = asyncio.run_coroutine_threadsafe(self.client.disconnect(), self._loop)
+                future.result(timeout=self.timeout + 5.0)
                 
             except Exception as e:
                 MCPLogger.log(TOOL_LOG_NAME, f"[BLETransport] Error during close: {e}")
             finally:
                 self._connected = False
                 self.client = None
+        # Always tear down the dedicated loop/thread (A5 fix)
+        self._stop_event_loop()
     
     def is_open(self) -> bool:
         """Check if BLE connection is open."""
@@ -2856,7 +2788,7 @@ class SSHTransport(BaseTransport):
             
             # Host key policy
             if allow_unknown_hosts:
-                MCPLogger.log(TOOL_LOG_NAME, "SSH: Using AutoAddPolicy (INSECURE - auto-accepting unknown hosts)")
+                MCPLogger.log(TOOL_LOG_NAME, "SSH: Using AutoAddPolicy with trust-on-first-use persistence (unknown hosts allowed)")
                 self.ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             else:
                 MCPLogger.log(TOOL_LOG_NAME, "SSH: Using RejectPolicy (secure - rejecting unknown hosts)")
@@ -2868,6 +2800,21 @@ class SSHTransport(BaseTransport):
                 MCPLogger.log(TOOL_LOG_NAME, "SSH: Loaded system host keys")
             except Exception as e:
                 MCPLogger.log(TOOL_LOG_NAME, f"SSH: Could not load system host keys: {e}")
+            
+            # B6 fix: When unknown hosts are allowed, give AutoAddPolicy trust-on-first-use
+            # persistence by loading (and later saving) our own writable known_hosts file.
+            # paramiko verifies loaded keys BEFORE invoking the missing-host policy, so a
+            # changed key on a later connect raises BadHostKeyException (MITM detection),
+            # rather than silently accepting any key with no continuity.
+            self._tofu_known_hosts_path = None
+            if allow_unknown_hosts:
+                try:
+                    self._tofu_known_hosts_path = str(get_user_data_directory() / "terminal_ssh_known_hosts")
+                    if os.path.exists(self._tofu_known_hosts_path):
+                        self.ssh_client.load_host_keys(self._tofu_known_hosts_path)
+                        MCPLogger.log(TOOL_LOG_NAME, "SSH: Loaded TOFU known_hosts (enables MITM detection on reconnect)")
+                except Exception as e:
+                    MCPLogger.log(TOOL_LOG_NAME, f"SSH: Could not load TOFU known_hosts: {e}")
             
             # Connect with authentication
             connect_kwargs = {
@@ -2967,6 +2914,22 @@ class SSHTransport(BaseTransport):
             MCPLogger.log(TOOL_LOG_NAME, "SSH: Initiating connection...")
             self.ssh_client.connect(**connect_kwargs)
             MCPLogger.log(TOOL_LOG_NAME, "SSH: Connection established")
+            
+            # B6 fix: surface the host-key fingerprint and persist it (TOFU) so the
+            # user can confirm the key and future connects detect a changed key.
+            if allow_unknown_hosts:
+                try:
+                    import hashlib
+                    remote_key = self.ssh_client.get_transport().get_remote_server_key()
+                    fingerprint = hashlib.sha256(remote_key.asbytes()).hexdigest()
+                    MCPLogger.log(TOOL_LOG_NAME,
+                                  f"SSH host key for {host}:{port} is {remote_key.get_name()} SHA256:{fingerprint} "
+                                  f"(trust-on-first-use - verify this fingerprint out-of-band)")
+                    if self._tofu_known_hosts_path:
+                        self.ssh_client.save_host_keys(self._tofu_known_hosts_path)
+                        MCPLogger.log(TOOL_LOG_NAME, "SSH: Persisted host key to TOFU known_hosts")
+                except Exception as e:
+                    MCPLogger.log(TOOL_LOG_NAME, f"SSH: Could not persist/surface host key: {e}")
             
             # Get transport for keepalives
             transport = self.ssh_client.get_transport()
@@ -3178,7 +3141,12 @@ class SSHTransport(BaseTransport):
                 
                 return data
             else:
-                # No data available (non-blocking)
+                # No data pending. Still check for a remote close/EOF so idle
+                # sessions detect disconnects promptly instead of only when data
+                # would next arrive (review D2).
+                if self.channel.closed or self.channel.eof_received:
+                    MCPLogger.log(TOOL_LOG_NAME, "SSH channel EOF/closed detected (no pending data)")
+                    raise TransportConnectionError("SSH channel closed by remote")
                 return b''
                 
         except TransportConnectionError:
@@ -3507,9 +3475,10 @@ class ProgramTransport(BaseTransport):
         self.bridge_port = None  # Port bridge will connect to
         self.bridge_token = None  # Authentication token
         
-        # Sanitize and log command for audit
+        # Sanitize and log command for audit. Command-line args frequently carry
+        # secrets (--token=..., --password ...), so mask them like env vars (review B5).
         sanitized_env = self._sanitize_env_for_logging(env) if env else None
-        MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Spawning: {command} {args}")
+        MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Spawning: {command} {self._sanitize_args_for_logging(self.args)}")
         MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Working directory: {cwd or os.getcwd()}")
         if sanitized_env:
             MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Environment: {sanitized_env}")
@@ -3551,6 +3520,36 @@ class ProgramTransport(BaseTransport):
             else:
                 sanitized[key] = value
         
+        return sanitized
+    
+    @staticmethod
+    def _sanitize_args_for_logging(args: List[str]) -> List[str]:
+        """Mask secret-bearing command-line arguments for logging (review B5).
+
+        Handles both '--token=SECRET' (value after '=') and the split
+        '--token SECRET' form (value is the following argument).
+        """
+        sensitive_flags = (
+            '--password', '--passwd', '--pass', '--token', '--secret',
+            '--api-key', '--apikey', '--key', '--auth', '--credential', '--credentials',
+        )
+        sanitized = []
+        mask_next = False
+        for arg in (args or []):
+            s = str(arg)
+            if mask_next:
+                sanitized.append('***')
+                mask_next = False
+                continue
+            low = s.lower()
+            if '=' in s and low.split('=', 1)[0] in sensitive_flags:
+                sanitized.append(s.split('=', 1)[0] + '=***')
+                continue
+            if low in sensitive_flags:
+                sanitized.append(s)
+                mask_next = True
+                continue
+            sanitized.append(s)
         return sanitized
     
     def _spawn_elevated_bridge(self):
@@ -3655,6 +3654,7 @@ class ProgramTransport(BaseTransport):
         import ctypes
         from ctypes import wintypes
         import sys
+        import subprocess
         
         # NOTE: We must use python.exe (not aura.exe/pythonw.exe) because:
         # - winpty requires a console subsystem to work properly
@@ -3667,14 +3667,18 @@ class ProgramTransport(BaseTransport):
             # Fallback to sys.executable (development)
             python_exe = sys.executable
         
-        # Build argument string: script path followed by all arguments, space-separated
+        # B4 fix: quote each argument with the Windows CommandLineToArgvW rules so
+        # arguments containing spaces or quotes cannot mis-split (or inject) when
+        # passed to ShellExecuteExW with the 'runas' (admin) verb.
         all_args = [bridge_script] + bridge_args
-        args_str = ' '.join(all_args)
+        args_str = subprocess.list2cmdline(all_args)
         
         MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Launching Windows bridge via ShellExecuteEx (UAC)...")
         MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Python: {python_exe}")
         MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Bridge: {bridge_script}")
-        MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Args: {bridge_args}")
+        # Mask secrets in the bridge argv before logging: it carries the bridge auth
+        # --token and the user's program --args (which may include --token/--password) (review B5).
+        MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Args: {self._sanitize_args_for_logging(bridge_args)}")
         
         try:
             # Use ShellExecuteEx with 'runas' verb for UAC elevation
@@ -3761,6 +3765,8 @@ class ProgramTransport(BaseTransport):
         import subprocess
         import sys
         
+        import shlex
+        
         # Find aura in same directory as bridge script
         bridge_dir = os.path.dirname(bridge_script)
         python_exe = os.path.join(bridge_dir, "aura")
@@ -3768,14 +3774,18 @@ class ProgramTransport(BaseTransport):
             # Fallback to sys.executable (development)
             python_exe = sys.executable or "python3"
         
-        # Build command as a single shell string for osascript
-        args_str = ' '.join(f'"{arg}"' for arg in bridge_args)
-        shell_cmd = f'{python_exe} "{bridge_script}" {args_str}'
+        # B4 fix: build the shell command with proper shell quoting for EVERY token
+        # (python_exe, bridge_script and all args), then escape the whole string for
+        # the AppleScript string literal. Without this, an argument containing a
+        # quote, $(...) or backtick could break out and run arbitrary code as root
+        # via osascript.
+        shell_cmd = ' '.join(shlex.quote(tok) for tok in ([python_exe, bridge_script] + bridge_args))
+        applescript_escaped = shell_cmd.replace('\\', '\\\\').replace('"', '\\"')
         
         MCPLogger.log(TOOL_LOG_NAME, "[ProgramTransport] Launching macOS bridge via osascript (GUI prompt)...")
         
         # Use osascript to run with administrator privileges (triggers GUI password prompt)
-        applescript = f'do shell script "{shell_cmd}" with administrator privileges'
+        applescript = f'do shell script "{applescript_escaped}" with administrator privileges'
         
         MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Launching macOS bridge via osascript with admin privileges")
         subprocess.Popen(
@@ -3842,7 +3852,10 @@ class ProgramTransport(BaseTransport):
         else:
             cmdline = self.command
         
-        MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Command line: {cmdline}")
+        # Log a masked command line - the real cmdline can carry secret args
+        # (--token/--password ...) which must not hit the log (review B5).
+        _masked_cmdline = f"{self.command} {' '.join(self._sanitize_args_for_logging(self.args))}" if self.args else self.command
+        MCPLogger.log(TOOL_LOG_NAME, f"[ProgramTransport] Command line: {_masked_cmdline}")
         
         # Create PTY
         self.pty_master = pywinpty.PTY(self.cols, self.rows)
@@ -4166,6 +4179,7 @@ class UnixSocketTransport(BaseTransport):
         import sys
         import socket as socket_module
         import os
+        import stat as stat_module
         
         if sys.platform == 'win32':
             raise TransportConnectionError("Unix domain sockets are not supported on Windows (use Named Pipes instead)")
@@ -4180,8 +4194,10 @@ class UnixSocketTransport(BaseTransport):
         if not os.path.exists(socket_path):
             raise TransportConnectionError(f"Socket file does not exist: {socket_path}")
         
-        # Check if it's a socket
-        if not os.path.stat(socket_path).st_mode & 0o140000:  # S_IFSOCK
+        # Check if it's a socket. NOTE: os.path has no stat(); use os.stat + the stat
+        # module's S_ISSOCK (the old os.path.stat call raised AttributeError, breaking
+        # EVERY unix:// open - review A1), mirroring the FIFO check below.
+        if not stat_module.S_ISSOCK(os.stat(socket_path).st_mode):
             raise TransportConnectionError(f"Path is not a socket: {socket_path}")
         
         # Connect to Unix socket
@@ -4548,8 +4564,9 @@ class terminal_session_metadata:
     session_start_time: datetime
     log_file_path: Path
     
-    # Transport info (filled in Phase 2)
-    transport_type: str  # "serial" | "tcp" | "websocket" (Phase 5)
+    # Transport info - derived from the endpoint by parse_endpoint
+    # (serial, tcp, telnet, rfc2217, ssh, websocket, unix, pipe, program, bluetooth, ble)
+    transport_type: str
     endpoint: str  # "COM3" or "192.168.1.123:23"
     
     # Statistics
@@ -4566,6 +4583,9 @@ class terminal_session_metadata:
     is_active: bool = True
     last_activity_time: datetime = None
     
+    # Agent-supplied label so sessions can be identified after context loss
+    session_note: str = ""
+
     # Phase 5L: Auto-reconnect support
     auto_reconnect_enabled: bool = False  # Enable persistent connection mode
     auto_reconnect_interval_ms: int = 500  # Retry interval in milliseconds
@@ -4789,6 +4809,10 @@ class session_container_with_log_file:
     
     # Response queue: Worker thread -> MCP thread (for synchronous operations)
     response_queue: Optional[queue.Queue] = None  # Responses from worker
+    # Serializes a command->response round-trip on the shared response_queue so
+    # concurrent MCP handler threads on the same session cannot consume each
+    # other's responses (review A10).
+    response_lock: Optional[threading.Lock] = None
     
     # Output queue: Worker thread -> MCP thread (for continuous reads)
     output_queue: Optional[queue.Queue] = None  # Incoming serial data
@@ -4821,6 +4845,8 @@ class session_container_with_log_file:
             self.async_operations_lock = threading.Lock()
         if self.metadata_lock is None:
             self.metadata_lock = threading.Lock()
+        if self.response_lock is None:
+            self.response_lock = threading.Lock()
         
         # Phase 3: Initialize sequence tracking
         if self.active_sequences is None:
@@ -4843,7 +4869,7 @@ class session_container_with_log_file:
 # Session cache (thread-safe)
 _active_sessions_cache: Dict[str, session_container_with_log_file] = {}
 _session_cache_lock = threading.Lock()
-_next_session_id = 1
+_next_session_id_per_transport: Dict[str, int] = {}
 
 # Main thread queue support (from python.py pattern)
 # This will be used in Phase 2 for serial port operations
@@ -4892,6 +4918,63 @@ def close_log_file(session: session_container_with_log_file):
             MCPLogger.log(TOOL_LOG_NAME, f"Error closing log file: {e}")
         finally:
             session.log_file_handle = None
+
+
+def _put_output_drop_oldest(output_queue: 'queue.Queue', item: tuple) -> None:
+    """Enqueue onto a bounded output queue, dropping the oldest item on overflow.
+
+    The worker must never block trying to enqueue received data - if the AI never
+    drains the queue (chatty device, auto-reconnect boot logs), an unbounded queue
+    would grow without limit (review A8). A bounded queue plus drop-oldest caps
+    memory while keeping the most recent output; using non-blocking puts also keeps
+    the worker from stalling and missing reads.
+    """
+    if output_queue is None:
+        return
+    try:
+        output_queue.put_nowait(item)
+    except queue.Full:
+        try:
+            output_queue.get_nowait()  # discard oldest
+        except queue.Empty:
+            pass
+        try:
+            output_queue.put_nowait(item)
+        except queue.Full:
+            pass
+
+
+def _rotate_session_log_if_needed(session: session_container_with_log_file) -> None:
+    """Rotate the per-session log file once it exceeds MAX_LOG_FILE_BYTES.
+
+    Long-lived / auto-reconnecting sessions on chatty devices would otherwise fill
+    the disk (review A15). Keeps a single rotated ".1" file and reopens fresh.
+    Only ever called from the worker thread (the sole writer of the log handle).
+    """
+    try:
+        if session.metadata.log_file_size_bytes < MAX_LOG_FILE_BYTES:
+            return
+        log_path = session.metadata.log_file_path
+        if session.log_file_handle:
+            try:
+                session.log_file_handle.flush()
+                session.log_file_handle.close()
+            except Exception:
+                pass
+            session.log_file_handle = None
+        rotated_path = Path(str(log_path) + ".1")
+        try:
+            if rotated_path.exists():
+                rotated_path.unlink()
+            os.replace(str(log_path), str(rotated_path))
+        except Exception as e:
+            MCPLogger.log(TOOL_LOG_NAME, f"Log rotation rename failed: {e}")
+        session.log_file_handle = open(log_path, 'wb', buffering=0)
+        with session.metadata_lock:
+            session.metadata.log_file_size_bytes = 0
+        MCPLogger.log(TOOL_LOG_NAME, f"Rotated session log (>{MAX_LOG_FILE_BYTES} bytes): {log_path}")
+    except Exception as e:
+        MCPLogger.log(TOOL_LOG_NAME, f"Log rotation error: {e}")
 
 # ============================================================================
 # CONTROL CHARACTER PARSING (Phase 2A)
@@ -5315,12 +5398,15 @@ def intercept_ansi_queries(data: bytes, carry: bytearray, terminal_size: Dict) -
             i += 5
             continue
         
-        # Incomplete sequence at end of buffer?
-        if i + 3 >= len(buf):
-            # Save for next chunk (could be start of query)
+        # Only carry a trailing ESC run to the next chunk if it is actually a
+        # prefix of a query we recognise (ESC[6n or ESC[18t). The old check
+        # carried ANY ESC within 3 bytes of the end - even complete-but-unknown
+        # sequences - needlessly delaying normal data (review D3).
+        remaining = bytes(buf[i:])
+        if remaining in (b'\x1b', b'\x1b[', b'\x1b[6', b'\x1b[1', b'\x1b[18'):
             break
         
-        # Unknown escape: pass through
+        # Unknown/complete escape sequence: pass the ESC through as normal data
         out.append(buf[i])
         i += 1
     
@@ -5838,6 +5924,10 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
     if session.transport and session.transport.is_open():
         session.reconnect_state.mark_connected()
     
+    # Track exit reason for logging
+    exit_reason = "unknown"
+    exit_details = ""
+    
     try:
         while not stop_event.is_set():
             # Phase 5L: Check if we need to reconnect
@@ -5846,11 +5936,15 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
                     # Enter reconnect loop
                     if not _worker_attempt_reconnect(session, session_id, stop_event, reconnect_interval_ms):
                         # Reconnect loop was stopped by stop_event
+                        exit_reason = "stop_requested"
+                        exit_details = "Stop event set during reconnect attempt"
                         break
                     # Successfully reconnected - continue main loop
                     continue
                 else:
                     # No auto-reconnect, exit
+                    exit_reason = "transport_closed"
+                    exit_details = "Transport closed and auto_reconnect disabled"
                     MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} transport closed, auto_reconnect disabled, exiting")
                     break
             
@@ -5919,6 +6013,9 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
                         session.metadata.log_file_size_bytes += len(data)
                         session.metadata.last_activity_time = datetime.now()
                     
+                    # Cap on-disk log growth via rotation (review A15)
+                    _rotate_session_log_if_needed(session)
+                    
                     # PHASE 3: Route data based on worker state
                     if session.worker_state == "executing_sequence" and session.current_sequence:
                         # BUG #1 FIX: Always accumulate data during sequences!
@@ -5938,12 +6035,8 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
                             overflow = len(session.current_sequence["accumulated_data"]) - max_bytes
                             del session.current_sequence["accumulated_data"][:overflow]
                     else:
-                        # Normal operation: put in output_queue
-                        if session.output_queue:
-                            session.output_queue.put(('data', data))
-                            MCPLogger.log(TOOL_LOG_NAME, f"QUEUE PUT session={session_id} type=data len={len(data)} qsize={session.output_queue.qsize()}")
-                    
-                    MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} received {len(data)} bytes (worker_state={session.worker_state}, seq={session.current_sequence is not None})")
+                        # Normal operation: put in bounded output_queue (drop-oldest on overflow)
+                        _put_output_drop_oldest(session.output_queue, ('data', data))
                 else:
                     # No data right now, tiny sleep to avoid busy-spin (Phase 5B fix)
                     time.sleep(0.005)  # 5ms
@@ -5981,8 +6074,7 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
                     # Notify AI via output_queue (once per disconnect)
                     if session.output_queue:
                         reconnect_msg = f"[AUTO_RECONNECT] {error_type}: {error_msg} - attempting to reconnect..."
-                        session.output_queue.put(('reconnect_start', reconnect_msg))
-                        MCPLogger.log(TOOL_LOG_NAME, f"QUEUE PUT session={session_id} type=reconnect_start")
+                        _put_output_drop_oldest(session.output_queue, ('reconnect_start', reconnect_msg))
                     
                     # Log to session log file
                     if session.log_file_handle:
@@ -5994,15 +6086,18 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
                     continue
                 else:
                     # No auto-reconnect, exit as before
+                    exit_reason = error_type
+                    exit_details = error_msg
                     with session.metadata_lock:
                         session.metadata.is_active = False
                     
                     if session.output_queue:
-                        session.output_queue.put(('error', error_msg))
-                        MCPLogger.log(TOOL_LOG_NAME, f"QUEUE PUT session={session_id} type=error msg={error_msg[:50]} qsize={session.output_queue.qsize()}")
+                        _put_output_drop_oldest(session.output_queue, ('error', error_msg))
                     break
             
             except Exception as e:
+                exit_reason = "unexpected_exception"
+                exit_details = f"{type(e).__name__}: {str(e)}"
                 MCPLogger.log(TOOL_LOG_NAME, f"Unexpected error in worker thread for session {session_id}: {e}")
                 
                 # Mark session as inactive
@@ -6015,12 +6110,12 @@ def serial_port_worker_thread(session_id: str, stop_event: threading.Event):
                 
                 if session.output_queue:
                     error_msg = str(e)
-                    session.output_queue.put(('error', error_msg))
-                    MCPLogger.log(TOOL_LOG_NAME, f"QUEUE PUT session={session_id} type=error msg={error_msg[:50]} qsize={session.output_queue.qsize()}")
+                    _put_output_drop_oldest(session.output_queue, ('error', error_msg))
                 break
                 
     finally:
         # Phase 5A1: Always cleanup (expert pattern - Part 21)
+        MCPLogger.log(TOOL_LOG_NAME, f"Worker thread stopped for session {session_id} - reason: {exit_reason} - {exit_details}")
         MCPLogger.log(TOOL_LOG_NAME, f"Worker thread stopped for session {session_id} - cleaning up")
         
         # Close transport
@@ -6079,7 +6174,7 @@ def _worker_attempt_reconnect(session: session_container_with_log_file, session_
                         
                         # Notify AI
                         if session.output_queue:
-                            session.output_queue.put(('port_missing', f"Port {port} not found - waiting for device..."))
+                            _put_output_drop_oldest(session.output_queue, ('port_missing', f"Port {port} not found - waiting for device..."))
                         
                         # Log to file
                         if session.log_file_handle:
@@ -6109,7 +6204,9 @@ def _worker_attempt_reconnect(session: session_container_with_log_file, session_
                 # Notify AI
                 if session.output_queue:
                     msg = f"[AUTO_RECONNECT] Connection restored after {session.reconnect_state.reconnect_attempts} attempts"
-                    session.output_queue.put(('reconnect_success', msg))
+                    if transport_type == "ssh":
+                        msg += " (WARNING: fresh SSH shell - working directory, environment variables, and running processes have been reset)"
+                    _put_output_drop_oldest(session.output_queue, ('reconnect_success', msg))
                 
                 # Log to file
                 if session.log_file_handle:
@@ -6277,18 +6374,18 @@ def _process_worker_command(session: session_container_with_log_file, cmd: tuple
             session.worker_state = "executing_sequence"
             MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} worker_state -> executing_sequence")
             
-            # If async, send immediate response
-            if options.get("async", False):
-                session.response_queue.put(("ok", {
-                    "sequence_id": sequence_id,
-                    "status": "started",
-                    "async": True
-                }))
-            # If blocking, response will come when sequence completes
+            # Async sequences are fire-and-forget: the handler already returned and
+            # does NOT read response_queue, so putting a "started" ack here would just
+            # leave a stray tuple to be mis-consumed by the next command (review A10).
+            # For blocking sequences the response comes via finish_sequence_* on
+            # completion. So nothing to put here.
         
         elif operation == "cancel_sequence":
-            # Cancel active sequence (handled in main loop, but acknowledge here)
-            session.response_queue.put(("ok", None))
+            # cancel_sequence is fire-and-forget (handle_cancel_sequence does not read
+            # response_queue); the actual cancellation result is delivered to the
+            # blocking send_sequence caller by the main loop. Don't put a stray ack
+            # here that could be mis-consumed by the next command (review A10).
+            pass
         
         elif operation == "set_terminal_emulation":
             # Configure terminal emulation
@@ -6303,6 +6400,24 @@ def _process_worker_command(session: session_container_with_log_file, cmd: tuple
                 "terminal_emulation_enabled": session.terminal_emulation_enabled,
                 "terminal_size": session.terminal_size
             }))
+        
+        elif operation == "upgrade_to_tls":
+            # A11 fix: perform the TLS wrap on the worker thread (the sole owner of
+            # the transport). Wrapping on the handler thread while this thread was
+            # inside transport.read() was a data race on the socket during the
+            # handshake. TLSWrapper consumes/updates the base transport's socket.
+            tls_verify = cmd[1]
+            tls_server_hostname = cmd[2]
+            try:
+                new_transport = TLSWrapper(
+                    session.transport,
+                    verify_cert=tls_verify,
+                    server_hostname=tls_server_hostname
+                )
+                session.transport = new_transport
+                session.response_queue.put(("ok", new_transport.get_tls_info()))
+            except Exception as e:
+                session.response_queue.put(("error", str(e)))
         
         else:
             MCPLogger.log(TOOL_LOG_NAME, f"Unknown command: {operation}")
@@ -6565,29 +6680,81 @@ def close_serial_port_safely(port):
 # SESSION LIFECYCLE MANAGEMENT
 # ============================================================================
 
-def create_new_session(endpoint: str, transport_type: str = "serial") -> str:
+def _generate_default_session_id_for_transport(transport_type: str) -> str:
+    """Generate a transport-aware default session ID like ssh_1, serial_2, tcp_1, etc.
+
+    Must be called while holding _session_cache_lock.
     """
-    Create a new MCU serial session.
-    
+    global _next_session_id_per_transport
+
+    prefix_map = {
+        "serial": "serial",
+        "tcp": "tcp",
+        "telnet": "telnet",
+        "ssh": "ssh",
+        "websocket": "ws",
+        "rfc2217": "rfc2217",
+        "bluetooth": "bt",
+        "ble": "ble",
+        "program": "prog",
+        "unix": "unix",
+        "pipe": "pipe",
+        "fifo": "fifo",
+    }
+    prefix = prefix_map.get(transport_type, "session")
+    counter = _next_session_id_per_transport.get(prefix, 1)
+    session_id = f"{prefix}_{counter}"
+    _next_session_id_per_transport[prefix] = counter + 1
+
+    # Handle unlikely collision with an agent-requested ID already in the cache
+    while session_id in _active_sessions_cache:
+        counter += 1
+        session_id = f"{prefix}_{counter}"
+        _next_session_id_per_transport[prefix] = counter + 1
+
+    return session_id
+
+
+def create_new_session(endpoint: str, transport_type: str = "serial",
+                       requested_session_id: str = None) -> str:
+    """Create a new terminal session.
+
     Args:
-        endpoint: Port name (e.g., "COM3", "/dev/ttyUSB0") or network address
-        transport_type: "serial", "tcp", "websocket", etc.
-        
+        endpoint: Port name or network address
+        transport_type: "serial", "tcp", "ssh", etc.
+        requested_session_id: Agent-requested ID (honoured if not already taken)
+
     Returns:
-        session_id: Unique identifier for this session
-        
-    Note: Phase 1 just creates the session structure and log file.
-          Phase 2 will add actual serial port opening.
+        session_id: The actual session ID assigned
+
+    Raises:
+        ValueError: If requested_session_id is already in use
     """
-    global _next_session_id
-    
+    # B2 fix: the session_id is embedded directly into the log filename, so an
+    # unsanitised value with path separators or '..' could escape terminal_logs/
+    # and create/overwrite a *.log file elsewhere. Restrict to a safe whitelist
+    # (no separators, so traversal is impossible).
+    if requested_session_id is not None:
+        if not re.match(r'^[A-Za-z0-9_.\-]{1,64}$', requested_session_id):
+            raise ValueError(
+                "Invalid session_id: use 1-64 characters from letters, digits, '_', '.', '-' "
+                "(no path separators or spaces)."
+            )
+
     with _session_cache_lock:
-        session_id = f"mcu_{_next_session_id}"
-        _next_session_id += 1
-        
+        if requested_session_id:
+            if requested_session_id in _active_sessions_cache:
+                raise ValueError(
+                    f"Session ID '{requested_session_id}' is already in use. "
+                    f"Choose a different session_id or omit it for an auto-generated one."
+                )
+            session_id = requested_session_id
+        else:
+            session_id = _generate_default_session_id_for_transport(transport_type)
+
         # Create log file
         log_path, log_handle = create_log_file_for_session(session_id)
-        
+
         # Create session metadata
         metadata = terminal_session_metadata(
             session_id=session_id,
@@ -6596,18 +6763,18 @@ def create_new_session(endpoint: str, transport_type: str = "serial") -> str:
             transport_type=transport_type,
             endpoint=endpoint
         )
-        
+
         # Create session container
         session = session_container_with_log_file(
             metadata=metadata,
             log_file_handle=log_handle
         )
-        
+
         # Store in cache
         _active_sessions_cache[session_id] = session
-        
+
         MCPLogger.log(TOOL_LOG_NAME, f"Created session {session_id} for endpoint {endpoint}")
-        
+
         return session_id
 
 def get_session(session_id: str) -> Optional[session_container_with_log_file]:
@@ -6751,8 +6918,27 @@ def create_transport_from_params(connection_params: Dict) -> Optional[BaseTransp
             ble_mode=connection_params.get("ble_mode", "uart")
         )
     
-    # SSH and program transports are not suitable for auto-reconnect
-    # (credentials/state issues)
+    elif transport_type == "ssh":
+        return SSHTransport(
+            host=connection_params["host"],
+            port=connection_params.get("port", 22),
+            username=connection_params.get("username"),
+            password=connection_params.get("password"),
+            key_filename=connection_params.get("key_filename"),
+            key_data=connection_params.get("key_data"),
+            key_password=connection_params.get("key_password"),
+            allow_unknown_hosts=connection_params.get("allow_unknown_hosts", False),
+            connect_timeout=connection_params.get("connect_timeout", 10.0),
+            terminal_type=connection_params.get("terminal_type", "xterm-256color"),
+            terminal_width=connection_params.get("terminal_width", 80),
+            terminal_height=connection_params.get("terminal_height", 24),
+            compression=connection_params.get("compression", False),
+            otp_secret=connection_params.get("otp_secret"),
+            otp_code=connection_params.get("otp_code"),
+            allow_agent=connection_params.get("allow_agent", False),
+        )
+
+    # Program transport is not suitable for auto-reconnect (process state is lost)
     else:
         raise TransportError(f"Transport type {transport_type} does not support auto-reconnect")
 
@@ -6767,49 +6953,79 @@ def close_session(session_id: str) -> Tuple[bool, str]:
     Returns:
         Tuple of (success, message)
     """
+    # A9 fix: only the dict removal needs the global cache lock. Pop the session
+    # out under the lock, then release it BEFORE the slow worker join / transport
+    # close / log flush - otherwise every other terminal operation (get_session,
+    # create_new_session, list_sessions, the duplicate-endpoint scan) would stall
+    # for up to the join timeout while one session closes.
     with _session_cache_lock:
         session = _active_sessions_cache.get(session_id)
-        
         if not session:
             return False, f"Session {session_id} not found"
-        
-        # Phase 2D: Stop unified worker thread if running
-        if session.worker_stop_event:
-            session.worker_stop_event.set()
-            
-        if session.worker_thread and session.worker_thread.is_alive():
-            MCPLogger.log(TOOL_LOG_NAME, f"Waiting for worker thread to stop for session {session_id}")
-            session.worker_thread.join(timeout=2.0)
-            
-        # Phase 5A1: Close transport (expert pattern - Part 21: resource cleanup)
-        if session.transport:
-            try:
-                session.transport.close()
-                MCPLogger.log(TOOL_LOG_NAME, f"Transport closed for session {session_id}")
-            except:
-                pass  # Ignore errors on close
-            session.transport = None
-        
-        # Keep serial_port cleanup for backward compatibility during migration
-        if session.serial_port:
-            try:
-                close_serial_port_safely(session.serial_port)
-            except:
-                pass
-            session.serial_port = None
-        
-        # Close log file
-        close_log_file(session)
-        
-        # Mark inactive
-        session.metadata.is_active = False
-        
-        # Remove from active cache
         del _active_sessions_cache[session_id]
-        
-        MCPLogger.log(TOOL_LOG_NAME, f"Closed session {session_id}")
-        
-        return True, f"Session {session_id} closed successfully"
+    
+    # Phase 2D: Stop unified worker thread if running (outside the cache lock)
+    if session.worker_stop_event:
+        session.worker_stop_event.set()
+    
+    if session.worker_thread and session.worker_thread.is_alive():
+        MCPLogger.log(TOOL_LOG_NAME, f"Waiting for worker thread to stop for session {session_id}")
+        session.worker_thread.join(timeout=2.0)
+    
+    # Phase 5A1: Close transport (expert pattern - Part 21: resource cleanup)
+    if session.transport:
+        try:
+            session.transport.close()
+            MCPLogger.log(TOOL_LOG_NAME, f"Transport closed for session {session_id}")
+        except:
+            pass  # Ignore errors on close
+        session.transport = None
+    
+    # Keep serial_port cleanup for backward compatibility during migration.
+    # (Retained deliberately: SerialTransport.close() does a plain port.close(),
+    # while close_serial_port_safely resets DTR/RTS first so closing does not
+    # reset attached ESP32/ESP8266 boards - see review D4 note.)
+    if session.serial_port:
+        try:
+            close_serial_port_safely(session.serial_port)
+        except:
+            pass
+        session.serial_port = None
+    
+    # Close log file
+    close_log_file(session)
+    
+    # Mark inactive
+    session.metadata.is_active = False
+    
+    MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} removed from active sessions cache")
+    MCPLogger.log(TOOL_LOG_NAME, f"Closed session {session_id} - reason: user_requested")
+    
+    return True, f"Session {session_id} closed successfully"
+
+
+def _shutdown_all_sessions():
+    """Close all active sessions on server shutdown/restart (review A13).
+
+    Worker threads are daemon threads, so without this they are killed abruptly:
+    serial ports would not be reset to a safe DTR/RTS state (risking leaving
+    ESP32/ESP8266 boards in a bad mode), sockets would dangle, and logs would not
+    be flushed. Registered via atexit so a normal interpreter exit cleans up.
+    """
+    try:
+        session_ids = list(_active_sessions_cache.keys())
+    except Exception:
+        return
+    if session_ids:
+        MCPLogger.log(TOOL_LOG_NAME, f"Shutdown: closing {len(session_ids)} active terminal session(s)")
+    for sid in session_ids:
+        try:
+            close_session(sid)
+        except Exception:
+            pass
+
+
+atexit.register(_shutdown_all_sessions)
 
 def list_active_sessions() -> List[Dict]:
     """Get list of all active sessions with their metadata"""
@@ -6829,12 +7045,49 @@ def list_active_sessions() -> List[Dict]:
                 "bytes_sent": session.metadata.total_bytes_sent,
                 "log_file_size_bytes": session.metadata.log_file_size_bytes,
                 "log_file_path": str(session.metadata.log_file_path),
-                "is_active": session.metadata.is_active
+                "is_active": session.metadata.is_active,
             }
+            if session.metadata.session_note:
+                session_info["session_note"] = session.metadata.session_note
             
             sessions_info.append(session_info)
         
         return sessions_info
+
+# ============================================================================
+# HELPER: Convert multiline text to array of lines for JSON-safe output
+# ============================================================================
+
+def multiline_text_to_description_array(text: str) -> list:
+  """Convert a multiline string into an array of individual lines.
+
+  This avoids long single-string JSON values that some IDEs truncate
+  when writing tool output to files. Each line becomes a separate
+  array element, keeping every line short and fully visible.
+  """
+  return text.split("\n")
+
+
+def normalize_local_file_path(raw_path: str) -> str:
+  """Expand ~ and normalize slashes in a local file path from agent input.
+
+  AI agents commonly use Unix-style paths like ~/.ssh/id_ed25519 regardless
+  of the host OS.  On Windows, ~ is not a valid path component and forward
+  slashes may confuse some libraries.  This helper:
+    1. Expands ~ (and ~user) to the real home directory (%USERPROFILE% on Windows)
+    2. Normalizes path separators to the OS convention via pathlib
+  Returns the cleaned path as a string, or the original string unchanged if
+  it does not start with ~ (no expansion needed, avoids surprises).
+  """
+  if not raw_path:
+    return raw_path
+  from pathlib import Path
+  try:
+    expanded = Path(raw_path).expanduser()
+    return str(expanded)
+  except Exception:
+    return raw_path
+
 
 # ============================================================================
 # MCP TOOL DEFINITION
@@ -6843,7 +7096,7 @@ def list_active_sessions() -> List[Dict]:
 TOOLS = [
     {
         "name": TOOL_NAME,
-        "description": """Use this to connect a persistant PuTTY-like terminalvia serial-port, telnet, tcp, sockets, pipes/FIFOs, websockets, Bluetooth, RFC2217, SSH, JTAG, or STDIO to local or remote devices, systems, services, and locally-spawned programs.""",
+        "description": """Use this to connect a persistent PuTTY-like terminal via serial-port, telnet, tcp, sockets, pipes/FIFOs, websockets, Bluetooth, RFC2217, SSH, or STDIO to local or remote devices, systems, services, and locally-spawned programs.""",
         "parameters": {
             "properties": {
                 "input": {
@@ -6858,23 +7111,24 @@ TOOLS = [
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["readme", "list_ports", "discover_network", "discover_bluetooth", "discover_ble", "bleak", "bleak_get_notifications", "bleak_disconnect", "open_session", "close_session", "list_sessions", "get_session_info", "send_data", "read_data", "wait_for_pattern", "send_async", "get_async_status", "cancel_async", "set_baud", "send_break", "get_line_states", "send_sequence", "get_sequence_status", "cancel_sequence", "set_terminal_emulation", "enable_bluetooth", "sftp_put", "sftp_get", "sftp_list", "upgrade_to_tls", "get_tls_info"],
+                    "enum": ["readme", "man", "list_ports", "discover_network", "discover_bluetooth", "discover_ble", "bleak", "bleak_get_notifications", "bleak_disconnect", "open_session", "close_session", "list_sessions", "get_session_info", "send_data", "read_data", "wait_for_pattern", "send_async", "get_async_status", "cancel_async", "set_baud", "send_break", "get_line_states", "send_sequence", "get_sequence_status", "cancel_sequence", "set_terminal_emulation", "enable_bluetooth", "sftp_put", "sftp_get", "sftp_list", "upgrade_to_tls", "get_tls_info"],
                     "description": "Operation to perform"
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "Session identifier for operations on existing sessions"
+                    "description": "Session identifier. For open_session: optional custom ID (e.g. 'build_server'); if omitted, auto-generated from transport type (ssh_1, serial_1, tcp_1, etc.). For all other operations: required, identifies the target session."
+                },
+                "session_note": {
+                    "type": "string",
+                    "description": "Free-text label for open_session (e.g. 'Agent-7 build-server deploy session'). Returned by list_sessions and get_session_info so agents can identify their own sessions after context loss."
                 },
                 "endpoint": {
                     "type": "string",
                     "description": "Serial port name (e.g., COM3, /dev/ttyUSB0) or network address for open_session"
                 },
-                "transport_type": {
-                    "type": "string",
-                    "enum": ["serial", "tcp", "websocket"],
-                    "default": "serial"
-                    # self evident from above: "description": "Transport type" #  (Phase 2A: only 'serial' supported)
-                },
+                # A16: the old 'transport_type' param was unused (transport is derived
+                # from the endpoint by parse_endpoint) and its enum listed only 3 of
+                # ~13 transports, so it was removed to avoid misleading callers/validation.
                 "baud_rate": {
                     "type": "integer",
                     "default": 115200,
@@ -6922,11 +7176,11 @@ TOOLS = [
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "Path to file (for send_async: source file to stream; for operations reading files)"
+                    "description": "Path to local file (for send_async: source file to stream). Paths with ~ are auto-expanded on all platforms."
                 },
                 "local_path": {
                     "type": "string",
-                    "description": "Local file path (for sftp_put: source file; for sftp_get: destination file)"
+                    "description": "Local file path (for sftp_put: source file; for sftp_get: destination file). Paths with ~ are auto-expanded on all platforms."
                 },
                 "remote_path": {
                     "type": "string",
@@ -6982,7 +7236,7 @@ TOOLS = [
                 "read_timeout": {
                     "type": "number",
                     "default": 1.0,
-                    "description": "Read timeout in seconds (for read_data and wait_for_pattern operations)"
+                    "description": "Read timeout in seconds (for read_data and wait_for_pattern). Capped at 240s to stay under the server's request timeout; for longer waits, poll repeatedly or use idle_timeout_seconds."
                 },
                 "idle_timeout_seconds": {
                     "type": "number",
@@ -7032,7 +7286,7 @@ TOOLS = [
                 },
                 "ssh_key_filename": {
                     "type": "string",
-                    "description": "Path to SSH private key file (alternative to password)"
+                    "description": "Path to SSH private key file (alternative to password). Paths like ~/.ssh/id_ed25519 are auto-expanded on all platforms including Windows."
                 },
                 "ssh_key_data": {
                     "type": "string",
@@ -7045,7 +7299,7 @@ TOOLS = [
                 "ssh_allow_unknown_hosts": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Auto-accept unknown SSH host keys" # TODO - make this default True? (we don't store host keys, do we?)
+                    "description": "Accept unknown SSH host keys on first connect (trust-on-first-use: the key is then persisted and a later change is rejected as a possible MITM). Leave false to require a pre-known host key."
                 },
                 "ssh_terminal_type": {
                     "type": "string",
@@ -7113,7 +7367,7 @@ TOOLS = [
                 },
                 "terminal_size": {
                     "type": "object",
-                    "description": "Terminal size for ANSI auto-response: {rows: 24, cols: 80}" # TODO: why we have this twice?
+                    "description": "Terminal size for set_terminal_emulation ANSI auto-response: {rows: 24, cols: 80}. (Distinct from ssh_terminal_width/height, which size the SSH PTY, and terminal_width/height, which size the program:// PTY.)"
                 },
                 "service_types": {
                     "type": "array",
@@ -7121,7 +7375,7 @@ TOOLS = [
                 },
                 "program_args": {
                     "type": "array",
-                    "description": "Command-line arguments for program:// transport (array of strings passed to spawned program)" # TODO - are these  credentials also sanitized in logs
+                    "description": "Command-line arguments for program:// transport (array of strings passed to spawned program; secret-bearing flags like --token/--password are masked in logs)"
                 },
                 "program_env": {
                     "type": "object",
@@ -7131,10 +7385,10 @@ TOOLS = [
                     "type": "string",
                     "description": "Working directory for program:// transport (path to directory where program should start)"
                 },
-                "terminal_width": { # TODO - why do we have the 3 times?
+                "terminal_width": {
                     "type": "integer",
-                    "default": 80
-                    # self-evident: "description": "Terminal width for program:// transport"
+                    "default": 80,
+                    "description": "Terminal width (cols) for the program:// PTY. (SSH uses ssh_terminal_width; ANSI emulation uses terminal_size.)"
                 },
                 "terminal_height": {
                     "type": "integer",
@@ -7188,12 +7442,12 @@ TOOLS = [
                 "use_tls": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Wrap transport with TLS/SSL encryption (Phase 6A). Works with TCP, telnet, RFC2217, Unix sockets, named pipes. Use for secure mail (SMTPS/IMAPS/POP3S), HTTPS, or any protocol requiring transport-layer encryption."
+                    "description": "Wrap transport with TLS/SSL encryption. Works with TCP, telnet, RFC2217, Unix sockets, named pipes. Use for secure mail (SMTPS/IMAPS/POP3S), HTTPS, or any protocol requiring transport-layer encryption."
                 },
                 "tls_verify": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Verify server certificate when using TLS (default True for security). Set to False for self-signed certificates. Only used when use_tls=True."
+                    "description": "Verify server certificate when using TLS (default True for security). Set to False only for self-signed certificates on a trusted network - disabling verification removes protection against man-in-the-middle attacks. Only used when use_tls=True."
                 },
                 "tls_server_hostname": {
                     "type": "string",
@@ -7208,18 +7462,9 @@ Full feature terminal with every kind of transport imaginable, including extreme
 
 For communicating with microcontrollers, and/or other devices and systems.
 
-## Feature Overview
+**For Bluetooth/BLE, RFC2217, Unix sockets, named pipes, program transport, and additional examples: use operation "man"**
 
-### Bluetooth Transports (Classic BT + BLE)
-  * Classic Bluetooth (RFCOMM/SPP): `bt://AA:BB:CC:DD:EE:FF` endpoint format
-  * Bluetooth Low Energy (BLE/GATT): `ble://11:22:33:44:55:66` endpoint format
-  * BLE UART mode: Automatic Nordic UART Service detection for serial-like communication
-  * Discovery operations: `discover_bluetooth` and `discover_ble` with full service details
-  * PIN/pairing support for Classic Bluetooth
-  * Use cases: ESP32 Bluetooth, HC-05/HC-06 modules, BLE sensors, fitness trackers
-  * pybluez for Classic BT (pre-built wheels included, graceful fallback if missing)
-  * bleak for BLE (pure Python, auto-installs if missing)
-  * Cross-platform: Windows, Linux, macOS
+## Feature Overview
 
 ### WebSocket Transport
   * `ws://host:port/path` and `wss://host:port/path` endpoint formats
@@ -7233,30 +7478,12 @@ For communicating with microcontrollers, and/or other devices and systems.
   * **Frame modes**: `auto` (default, detect JSON), `text` (always text), `binary` (always binary)
   * **Use cases**: Chrome DevTools Protocol debugging, JSON-RPC APIs, IoT web consoles
 
-### RFC2217 Transport (Remote Serial Port Control)
-  * `rfc2217://host:port` endpoint format (e.g., `rfc2217://192.168.1.100:2217`)
-  * Full RFC2217 COM-PORT-OPTION support (telnet + serial control)
-  * Control remote serial ports: DTR/RTS, baud rate, break signal
-  * Read modem state: CTS/DSR/RI/CD line states
-  * All serial operations work over network
-
-### Unix Domain Sockets & Named Pipes
-  * `unix:///path/to/socket` for Unix domain sockets (Linux/macOS)
-  * `pipe://\\\\.\\pipe\\name` for Windows named pipes
-  * `fifo:///path/to/fifo` for POSIX FIFOs
-  * Use case: Docker containers, databases, local services, legacy integration
-
-### Program/STDIO Transport
-  * `program://command` endpoint format (e.g., `program://python`, `program://bash`)
-  * Cross-platform PTY support (pty on POSIX, pywinpty on Windows)
-  * Full ANSI escape sequence support (colors, cursor movement)
-  * Use case: MCP tool testing, interactive REPLs, build monitoring, CLI automation
-
-### Network Device Discovery (mDNS/DNS-SD)
-  * `discover_network` operation finds devices advertising services
-  * Auto-install zeroconf library if missing
-  * Works cross-platform: Windows (Bonjour), Linux/WSL (Avahi), macOS (native)
-  * Returns device names, IPs, ports, services for easy connection
+### Other Transports (see "man" for details)
+  * RFC2217: `rfc2217://host:port` - remote serial port control over network
+  * Unix sockets: `unix:///path/to/socket`, Named pipes: `pipe://\\\\.\\pipe\\name`, FIFOs: `fifo:///path`
+  * Program/STDIO: `program://command` - spawn local programs with PTY support
+  * Network discovery: `discover_network` operation (mDNS/DNS-SD)
+  * Bluetooth: `bt://AA:BB:CC:DD:EE:FF` (Classic) and `ble://` (BLE/GATT)
 
 ### SSH Transport
   * `ssh://user@host:port` endpoint format (e.g., `ssh://aura@server.local:22`)
@@ -7323,11 +7550,7 @@ For communicating with microcontrollers, and/or other devices and systems.
 
 ONE worker thread owns the transport (serial port, TCP socket, or other connection) for its entire 
 lifetime. The MCP handler thread sends commands via queues and never touches the transport directly. 
-This eliminates all race conditions and follows expert-recommended patterns for communication.
-
 All operations (send_data, read_data, sequences, etc.) work identically across all transports. 
-The worker thread doesn't care about transport type!
-
 ## Usage-Safety Token System
 This tool uses an hmac-based token system to ensure callers fully understand all details.
 The token is specific to this installation, user, and code version.
@@ -7346,213 +7569,16 @@ Parameters: None
 Returns: Array of port information (device, description, hwid, etc.)
 
 ### discover_network
-Discover devices on local network via mDNS/DNS-SD (Bonjour).
-Similar to how Arduino IDE discovers network-enabled boards.
+Discover devices on local network via mDNS/DNS-SD. See "man" for full details.
+Parameters: service_types (optional), read_timeout (optional, default 5.0)
+Returns: total_devices, devices array with name/hostname/ip/port/service
 
-Parameters:
-- service_types (optional): Array of DNS-SD service types to search for
-  Default: ['_telnet._tcp.local.', '_ssh._tcp.local.', '_arduino._tcp.local.', '_http._tcp.local.']
-  Examples: ['_ssh._tcp.local.'], ['_telnet._tcp.local.', '_http._tcp.local.']
-- read_timeout (optional): How long to listen for mDNS responses in seconds (default 5.0)
-
-Returns:
-- total_devices: Number of devices found
-- devices: Array of discovered devices with format:
-  {
-    "name": "Esp32Lcd06",
-    "hostname": "Esp32Lcd06.local",
-    "ip": "172.22.1.103",
-    "port": 23,
-    "service": "telnet",
-    "service_type": "_telnet._tcp.local."
-  }
-
-**Platform Requirements:**
-- Windows: Requires Bonjour service (install iTunes or Bonjour Print Services)
-- Linux/WSL: Works out-of-box with Avahi daemon
-- macOS: Works out-of-box with native mDNS support
-
-**Example:**
-```json
-// Discover all common embedded device services
-{"operation": "discover_network", "tool_unlock_token": "..."}
-
-// Discover only SSH servers (5 second scan)
-{"operation": "discover_network", "service_types": ["_ssh._tcp.local."], "read_timeout": 5.0, "tool_unlock_token": "..."}
-
-// Then connect to discovered device:
-{"operation": "open_session", "endpoint": "telnet://Esp32Lcd06.local:23", "tool_unlock_token": "..."}
-```
-
-### bleak
-**Generic BLE (GATT) operations using python bleak library API directly.**
-
-This operation exposes bleak's API so the AI can use its existing knowledge of the bleak library.
-Auto-manages BLE connections per device address - first operation to an address creates a persistent
-connection, subsequent operations reuse it. Perfect for hardware hackers who need full BLE control!
-
-**Connection Management:**
-- Each device address gets its own persistent BLE connection
-- First `bleak` operation to an address auto-creates connection
-- Connection persists for notifications and multiple operations
-- Use `bleak_disconnect` to explicitly close connection
-- Connections are separate from transport sessions (bt://, ble://)
-
-**Supported Methods:**
-- `read_gatt_char` - Read a GATT characteristic once
-- `write_gatt_char` - Write to a GATT characteristic
-- `start_notify` - Subscribe to characteristic notifications (queues data)
-- `stop_notify` - Unsubscribe from notifications
-- `read_gatt_descriptor` - Read a GATT descriptor
-- `write_gatt_descriptor` - Write to a GATT descriptor
-- `get_services` - Get all services/characteristics from device
-
-Parameters:
-- address (required): BLE MAC address (e.g., "11:22:33:44:55:66")
-- method (required): Bleak method name (see supported methods above)
-- char_uuid (required for char operations): Characteristic UUID (e.g., "00002a37-0000-1000-8000-00805f9b34fb")
-- service_uuid (optional): Service UUID to narrow down characteristic search
-- data (required for write operations): Data to write (string, bytes, or array of ints)
-- timeout (optional): Operation timeout in seconds (default 10.0)
-
-**Returns:**
-- For `read_gatt_char`: {"value": bytes, "value_hex": "01 02 03"}
-- For `write_gatt_char`: {"success": true, "bytes_written": N}
-- For `start_notify`: {"success": true, "callback_id": "address:char_uuid"}
-- For `get_services`: {"services": [...]} with full service/characteristic tree
-
-**Notifications:**
-- Use `bleak_get_notifications` operation to poll queued notifications
-- Notifications are keyed by callback_id (address:char_uuid)
-- Queue has max size (default 100) to prevent memory issues
-
-**Examples:**
-
-1. Read heart rate from fitness tracker:
-```json
-{
-  "operation": "bleak",
-  "address": "AA:BB:CC:DD:EE:FF",
-  "method": "read_gatt_char",
-  "char_uuid": "00002a37-0000-1000-8000-00805f9b34fb",
-  "tool_unlock_token": "..."
-}
-```
-
-2. Write to custom BLE device:
-```json
-{
-  "operation": "bleak",
-  "address": "11:22:33:44:55:66",
-  "method": "write_gatt_char",
-  "char_uuid": "12345678-1234-1234-1234-123456789abc",
-  "data": [0x01, 0x02, 0x03],
-  "tool_unlock_token": "..."
-}
-```
-
-3. Subscribe to temperature sensor notifications:
-```json
-{
-  "operation": "bleak",
-  "address": "AA:BB:CC:DD:EE:FF",
-  "method": "start_notify",
-  "char_uuid": "00002a1c-0000-1000-8000-00805f9b34fb",
-  "tool_unlock_token": "..."
-}
-```
-
-4. Poll for notifications:
-```json
-{
-  "operation": "bleak_get_notifications",
-  "callback_id": "AA:BB:CC:DD:EE:FF:00002a1c-0000-1000-8000-00805f9b34fb",
-  "timeout": 5.0,
-  "tool_unlock_token": "..."
-}
-```
-
-5. Disconnect when done:
-```json
-{
-  "operation": "bleak_disconnect",
-  "address": "AA:BB:CC:DD:EE:FF",
-  "tool_unlock_token": "..."
-}
-```
-
-6. Get all services/characteristics:
-```json
-{
-  "operation": "bleak",
-  "address": "AA:BB:CC:DD:EE:FF",
-  "method": "get_services",
-  "tool_unlock_token": "..."
-}
-```
-
-**Use Cases:**
-- Read BLE sensor data (temperature, humidity, pressure)
-- Control BLE actuators (LEDs, motors, relays)
-- Monitor fitness trackers (heart rate, steps, battery)
-- Interact with custom BLE devices (ESP32 BLE, Nordic nRF52)
-- Reverse-engineer BLE protocols
-- Build BLE automation scripts
-- Beacon scanning and analysis
-
-**Note:** This is separate from `open_session` with `ble://` endpoints. Use this for:
-- Ad-hoc BLE operations (read/write once)
-- Multiple characteristics on same device
-- Notification subscriptions
-
-Use `open_session` with `ble://` for:
-- Nordic UART Service (serial-like communication)
-- Continuous bidirectional data streams
-
-### bleak_get_notifications
-Poll for queued BLE notifications from a subscribed characteristic.
-
-Parameters:
-- callback_id (required): Callback ID from start_notify (format: "address:char_uuid")
-- timeout (optional): How long to wait for notifications (default 1.0 seconds)
-- max_notifications (optional): Maximum notifications to return (default 100)
-
-Returns:
-- notifications: Array of {timestamp, value, value_hex} objects
-- count: Number of notifications returned
-- has_more: True if more notifications are queued
-
-Example:
-```json
-{
-  "operation": "bleak_get_notifications",
-  "callback_id": "AA:BB:CC:DD:EE:FF:00002a1c-0000-1000-8000-00805f9b34fb",
-  "timeout": 2.0,
-  "max_notifications": 50,
-  "tool_unlock_token": "..."
-}
-```
-
-### bleak_disconnect
-Explicitly disconnect from a BLE device.
-
-Parameters:
-- address (required): BLE MAC address to disconnect
-
-Returns:
-- success: true
-- message: Confirmation message
-
-Example:
-```json
-{
-  "operation": "bleak_disconnect",
-  "address": "AA:BB:CC:DD:EE:FF",
-  "tool_unlock_token": "..."
-}
-```
-
-**Note:** Connections auto-close after 5 minutes of inactivity, so explicit disconnect is optional.
+### Bluetooth/BLE Operations (see "man" for full details)
+- `discover_bluetooth` / `discover_ble`: Scan for nearby devices
+- `bleak`: Generic BLE GATT operations (read/write characteristics, notifications, services)
+- `bleak_get_notifications`: Poll queued BLE notifications
+- `bleak_disconnect`: Close BLE connection
+- `enable_bluetooth`: Enable Bluetooth adapter
 
 ### open_session
 Open a connection (serial port or TCP) and create a session with background reader and writer threads.
@@ -7562,6 +7588,7 @@ Open a connection (serial port or TCP) and create a session with background read
 - TCP: "tcp://host:port" → Opens raw TCP socket (e.g., "tcp://192.168.1.103:23")
 
 Parameters:
+- session_id (optional): Custom session ID (e.g. "build_server"). If omitted, auto-generated from transport type: ssh_1, serial_1, tcp_1, ws_1, telnet_1, bt_1, etc. Error if ID already in use.
 - endpoint (required): Connection endpoint (format determines transport type)
   * Serial examples: "COM6", "/dev/ttyUSB0"
   * TCP examples: "tcp://192.168.1.103:23", "tcp://mcu.local:5000"
@@ -7581,16 +7608,20 @@ Parameters:
 **TCP-specific parameters** (ignored for serial):
 - connect_timeout (optional): Connection timeout in seconds (default 5.0)
 
-**Auto-reconnect parameters** (Phase 5L - works with serial, TCP, telnet, websocket, bluetooth, BLE):
+**Session labelling** (for multi-agent environments):
+- session_note (optional): Free-text label (e.g. "Agent-7 deploy session"). Returned by list_sessions/get_session_info so agents can re-identify their sessions after context loss.
+
+**Auto-reconnect parameters** (works with serial, TCP, telnet, websocket, bluetooth, BLE, SSH):
 - auto_reconnect (optional): Enable persistent connection mode (default False)
   * When enabled, session stays alive on disconnect and retries connection automatically
-  * Perfect for: ESP32/MCU that resets (capture boot logs!), flaky USB connections, ephemeral device ports, network hiccups
+  * Perfect for: ESP32/MCU that resets (capture boot logs!), flaky USB/network connections, SSH sessions that drop
   * The session log file captures ALL data including reconnection events
+  * For SSH: creates a fresh shell on reconnect (shell state like cwd is reset, but the session_id and log stay the same)
 - auto_reconnect_interval_ms (optional): Retry interval in milliseconds (default 500)
   * Faster = more responsive but higher CPU, slower = gentler on system
   * For serial ports, also checks if port exists before attempting connection
 
-**TLS/SSL parameters** (Phase 6A - works with TCP, telnet, RFC2217, Unix sockets, named pipes):
+**TLS/SSL parameters** (works with TCP, telnet, RFC2217, Unix sockets, named pipes):
 - use_tls (optional): Wrap transport with TLS/SSL encryption (default False)
   * Enables direct TLS connection (encrypted from start)
   * Use for: SMTPS (port 465/52465), IMAPS (port 993/52993), POP3S (port 995/52995), HTTPS, etc.
@@ -7607,60 +7638,24 @@ Returns: session_id, log_file_path, transport_type, and connection status
 **SSH-specific parameters** (ignored for serial/TCP/Telnet):
 - ssh_username (optional): Username for SSH auth (can also be in endpoint)
 - ssh_password (optional): Password for SSH auth
-- ssh_key_filename (optional): Path to private key file
+- ssh_key_filename (optional): Path to private key file (~ auto-expanded, e.g. ~/.ssh/id_ed25519)
 - ssh_key_data (optional): Inline private key data
 - ssh_key_password (optional): Password for encrypted key
-- ssh_allow_unknown_hosts (optional): Auto-accept unknown host keys (INSECURE! default False)
+- ssh_allow_unknown_hosts (optional): Accept an unknown host key on first connect (trust-on-first-use; key is persisted and a later change is rejected). Default False.
 - ssh_terminal_type (optional): Terminal type for PTY (default "xterm-256color")
 - ssh_terminal_width (optional): Terminal width (default 80)
 - ssh_terminal_height (optional): Terminal height (default 24)
 
 **Examples:**
 ```json
-// Serial connection
 {"operation": "open_session", "endpoint": "COM6", "baud_rate": 115200, "tool_unlock_token": "..."}
-
-// SSH connection with password
-{"operation": "open_session", "endpoint": "ssh://aura@172.22.1.66:52266", "ssh_password": "mypassword", "ssh_allow_unknown_hosts": true, "tool_unlock_token": "..."}
-
-// SSH with key file
-{"operation": "open_session", "endpoint": "ssh://user@server.com:22", "ssh_key_filename": "/home/user/.ssh/id_rsa", "tool_unlock_token": "..."}
-
-// Telnet connection (with IAC handling)
-{"operation": "open_session", "endpoint": "telnet://192.168.1.103:23", "connect_timeout": 10.0, "tool_unlock_token": "..."}
-
-// TCP connection (raw bytes, no IAC)
-{"operation": "open_session", "endpoint": "tcp://192.168.1.103:23", "connect_timeout": 10.0, "tool_unlock_token": "..."}
-
-// WebSocket connection with auto-detect mode (default - detects JSON automatically)
-{"operation": "open_session", "endpoint": "ws://127.0.0.1:9222/devtools/page/ABC123", "tool_unlock_token": "..."}
-
-// WebSocket with explicit text mode (for JSON-RPC, CDP, text APIs)
-{"operation": "open_session", "endpoint": "ws://api.example.com/rpc", "ws_mode": "text", "tool_unlock_token": "..."}
-
-// WebSocket with binary mode (for raw binary protocols)
-{"operation": "open_session", "endpoint": "ws://device.local/binary", "ws_mode": "binary", "tool_unlock_token": "..."}
-
-// WebSocket with custom headers (authentication)
-{"operation": "open_session", "endpoint": "ws://api.example.com/ws", "ws_headers": {"Authorization": "Bearer token123"}, "tool_unlock_token": "..."}
-
-// Auto-reconnect enabled for ESP32 that resets (Phase 5L - captures boot logs!)
-{"operation": "open_session", "endpoint": "COM22", "baud_rate": 115200, "auto_reconnect": true, "tool_unlock_token": "..."}
-
-// Direct TLS connection (Phase 6A - encrypted from start)
-{"operation": "open_session", "endpoint": "tcp://mail.example.com:465", "use_tls": true, "tls_verify": false, "tool_unlock_token": "..."}
-
-// Secure IMAP connection
+{"operation": "open_session", "endpoint": "ssh://user@host:22", "ssh_password": "pass", "ssh_allow_unknown_hosts": true, "session_note": "Agent-7 build server", "tool_unlock_token": "..."}
+{"operation": "open_session", "endpoint": "ssh://deploy@prod:22", "ssh_key_filename": "~/.ssh/id_ed25519", "ssh_allow_unknown_hosts": true, "auto_reconnect": true, "session_note": "prod deploy session", "tool_unlock_token": "..."}
+{"operation": "open_session", "endpoint": "telnet://192.168.1.103:23", "tool_unlock_token": "..."}
+{"operation": "open_session", "endpoint": "tcp://192.168.1.103:23", "tool_unlock_token": "..."}
+{"operation": "open_session", "endpoint": "ws://127.0.0.1:9222/devtools/page/ABC", "tool_unlock_token": "..."}
+{"operation": "open_session", "endpoint": "COM22", "auto_reconnect": true, "tool_unlock_token": "..."}
 {"operation": "open_session", "endpoint": "tcp://mail.example.com:993", "use_tls": true, "tool_unlock_token": "..."}
-
-// TLS over telnet (encrypted telnet)
-{"operation": "open_session", "endpoint": "telnet://device.local:992", "use_tls": true, "tls_verify": false, "tool_unlock_token": "..."}
-
-// Auto-reconnect with faster retry for time-critical boot log capture
-{"operation": "open_session", "endpoint": "COM22", "auto_reconnect": true, "auto_reconnect_interval_ms": 100, "tool_unlock_token": "..."}
-
-// Auto-reconnect for flaky network connection
-{"operation": "open_session", "endpoint": "tcp://192.168.1.50:23", "auto_reconnect": true, "tool_unlock_token": "..."}
 ```
 
 ### send_data
@@ -7682,61 +7677,34 @@ Examples:
 
 Returns: bytes_sent confirmation
 
-### CRITICAL: Escaping and Multi-Line Content
+### CRITICAL: Escaping
 
-**Escape processing:** The data field supports these escape sequences:
-{BS}r (CR), {BS}n (LF), {BS}t (TAB), {BS}xNN (hex byte), {BS}uNNNN (Unicode), {BS}{BS} (literal backslash), {BS}^ (literal caret), ^C/^D/etc (control chars).
-
-**JSON double-escaping:** Since your tool call is JSON, backslashes need double-escaping.
-Write `{BS}{BS}r{BS}{BS}n` in your JSON string to get `{BS}r{BS}n` after JSON parsing, which our parser then converts to CR+LF.
-Writing a plain JSON `{BS}n` also works (JSON makes it a real newline byte, sent as-is), but
-every newline acts as pressing Enter in a terminal - see multi-line warning below.
-
-**Sending multi-line content (scripts, config files, etc.):**
-Every {BS}r{BS}n sent to a terminal acts as pressing Enter. If you send a multi-line bash script
-or Python function, each line executes independently as a separate command, causing syntax errors.
-
-Solutions (best to worst):
-
-1. **sftp_put** (SSH sessions - BEST for scripts/files):
-   Write content to a local temp file, then upload via SFTP and execute:
-   sftp_put local_path="/tmp/myscript.py" remote_path="/tmp/myscript.py"
-   send_data data="python3 /tmp/myscript.py{BS}r{BS}n"
-
-2. **heredoc** (bash/sh sessions):
-   Shell collects lines until delimiter without executing them:
-   data="cat > /tmp/script.sh << 'EOF'{BS}r{BS}nline1{BS}r{BS}nline2{BS}r{BS}nEOF{BS}r{BS}n"
-
-3. **base64** (any session with base64 command):
-   data="echo 'BASE64STRING' | base64 -d > /tmp/script.sh{BS}r{BS}n"
-
-4. **printf** (any POSIX shell):
-   data="printf 'line1{BS}{BS}nline2{BS}{BS}nline3' > /tmp/file.txt{BS}r{BS}n"
-   (The {BS}{BS}n inside printf's quotes is a printf escape for newline, not Enter)
-
-5. **Line-by-line** (interactive REPLs only):
-   Send each line with {BS}r{BS}n and let the REPL prompt for more.
-   For MicroPython, use paste mode (^E) to enter multi-line blocks.
+**Escapes:** {BS}r (CR), {BS}n (LF), {BS}t (TAB), {BS}xNN (hex), ^C/^D (control chars).
+**JSON double-escaping:** Write `{BS}{BS}r{BS}{BS}n` in JSON to get CR+LF.
+**Multi-line scripts:** Use sftp_put (best), heredoc, or base64 - NOT raw {BS}r{BS}n per line.
+Use operation "man" for the full escaping guide.
 
 ### read_data
 Read data from session (waits for timeout or max_bytes or idle timeout).
 
 Parameters:
 - session_id (required): Session to read from
-- read_timeout (optional): Maximum total wait time in seconds, default 1.0
-- idle_timeout_seconds (optional): Stop after N seconds of SILENCE. Useful for unpredictable streams (AI responses, compilation logs, test suites). If data keeps arriving, keep reading. Example: `read_timeout=3600, idle_timeout_seconds=30` means "read for up to 1 hour, but stop after 30 seconds of no new data"
+- read_timeout (optional): Maximum total wait time in seconds, default 1.0 (capped at 240s - see note below)
+- idle_timeout_seconds (optional): Stop after N seconds of SILENCE. Useful for unpredictable streams (AI responses, compilation logs, test suites). If data keeps arriving, keep reading. Example: `read_timeout=240, idle_timeout_seconds=30` means "read for up to 240 seconds, but stop after 30 seconds of no new data"
+
+**Long waits:** read_timeout is capped at 240s to stay under the server's ~270s request timeout. To watch something for longer, call read_data repeatedly in a poll loop (data keeps buffering between calls), optionally with idle_timeout_seconds.
 - max_bytes (optional): Maximum bytes to read, default 65536
 
-Returns: data (UTF-8 string), data_hex, bytes_read, timeout_reached, idle_timeout_reached (Phase 4B)
+Returns: data (UTF-8 string), data_hex, bytes_read, timeout_reached, idle_timeout_reached
 
-### wait_for_pattern (Phase 2B + 4B - Enhanced!)
+### wait_for_pattern
 Smart queue reading with pattern detection. Wait until pattern appears or timeout or idle timeout.
 
 Parameters:
 - session_id (required): Session to read from
 - pattern (required): Pattern to search for (string)
-- read_timeout (optional): Maximum total wait time in seconds, default 5.0
-- idle_timeout_seconds (optional): Also stop if N seconds of silence (even if pattern not found). Useful when pattern might not appear, but device goes quiet. Example: `read_timeout=300, idle_timeout_seconds=10` means "wait up to 5 minutes for pattern, but also stop if 10 seconds pass with no new data"
+- read_timeout (optional): Maximum total wait time in seconds, default 5.0 (capped at 240s; poll again for longer waits)
+- idle_timeout_seconds (optional): Also stop if N seconds of silence (even if pattern not found). Useful when pattern might not appear, but device goes quiet. Example: `read_timeout=240, idle_timeout_seconds=10` means "wait up to 240s for pattern, but also stop if 10 seconds pass with no new data"
 - max_bytes (optional): Maximum bytes to collect, default 65536
 - use_regex (optional): Use regex matching, default False
 
@@ -7745,7 +7713,7 @@ Returns:
 - data: All data collected (including pattern)
 - bytes_read: Total bytes collected
 - timeout_reached: True if timed out before pattern
-- idle_timeout_reached: **Phase 4B NEW!** True if stopped due to silence (Phase 4B)
+- idle_timeout_reached: True if stopped due to silence
 - elapsed_seconds: Actual wait time
 
 Use Case: Essential for sequences! Wait for CLI prompts, responses, etc.
@@ -7756,9 +7724,9 @@ Examples:
 - Wait for regex pattern: pattern="{BS}[{BS}d+{BS}]", use_regex=True
 - Wait for prompt OR silence: pattern=">>>", idle_timeout_seconds=5.0
 
-**Architecture**: Queue-based (no file access), foundation for Phase 3 sequences!
+**Architecture**: Queue-based (no file access).
 
-### send_sequence (Phase 3 - NEW!)
+### send_sequence
 Execute an atomic sequence of actions with precise timing. Perfect for bootloader entry, device initialization, complex command flows.
 
 Parameters:
@@ -7790,30 +7758,12 @@ Returns (async mode):
 - status: "started"
 - async: true
 
-Safety Features:
-- Refuses to start if async upload in progress (prevents data corruption)
-- Rolling window prevents memory explosion on chatty devices (default 64KB per wait_for)
-- Auto-stabilization delays after DTR/RTS/baud changes (50-100ms)
-- Out-of-band cancellation support
-- Continuous serial reading (never lose data!)
-
-Example: ESP32 Bootloader Entry
+Example (ESP32 Bootloader Entry):
 ```json
-{
-  "operation": "send_sequence",
-  "session_id": "mcu_1",
-  "sequence": [
-    {"action": "set_dtr", "value": false},
-    {"action": "set_rts", "value": true},
-    {"action": "wait", "seconds": 0.05},
-    {"action": "set_dtr", "value": true},
-    {"action": "set_rts", "value": false},
-    {"action": "wait_for", "pattern": "waiting for download", "timeout": 3.0}
-  ]
-}
+{"operation": "send_sequence", "session_id": "mcu_1", "sequence": [{"action": "set_dtr", "value": false}, {"action": "set_rts", "value": true}, {"action": "wait", "seconds": 0.05}, {"action": "set_dtr", "value": true}, {"action": "set_rts", "value": false}, {"action": "wait_for", "pattern": "waiting for download", "timeout": 3.0}]}
 ```
 
-### get_sequence_status (Phase 3 - NEW!)
+### get_sequence_status
 Query status of an async (fire-and-forget) sequence.
 
 Parameters:
@@ -7829,7 +7779,7 @@ Returns:
 
 Use Case: Check progress of hour-long milling jobs, firmware uploads, etc.
 
-### cancel_sequence (Phase 3 - NEW!)
+### cancel_sequence
 Cancel a currently executing sequence (gracefully stops at next action).
 
 Parameters:
@@ -7839,44 +7789,10 @@ Returns:
 - success: true
 - message: "Cancel signal sent to worker thread"
 
-Notes:
-- Cancellation is out-of-band (checked even while executing actions)
-- Sequence stops gracefully at next action boundary
-- Partial results are saved
-- Session remains open and usable after cancellation
-
-### set_terminal_emulation (Phase 3 - NEW!)
-Enable/disable ANSI terminal emulation. When enabled, the tool auto-responds to ANSI queries from MCU-based full-screen editors.
-
-Parameters:
-- session_id (required): Session to configure
-- enabled (required): true to enable, false to disable
-- terminal_size (optional): {rows: 24, cols: 80}
-
-Supported ANSI Queries (auto-response when enabled):
-- ESC[6n (Cursor position query) → ESC[24;80R
-- ESC[18t (Terminal size query) → ESC[8;24;80t
-
-Returns:
-- terminal_emulation_enabled: Current state
-- terminal_size: Current terminal size
-
-Use Case: Makes ESP32-based full-screen editors (like arrow-key navigable text editors) work correctly!
-
-Example:
-```json
-{
-  "operation": "set_terminal_emulation",
-  "session_id": "mcu_1",
-  "enabled": true,
-  "terminal_size": {"rows": 40, "cols": 120}
-}
-```
-
-**Architecture Note**: Terminal emulation runs in worker thread BEFORE logging, so:
-- ANSI queries are stripped from logs and output_queue (you see clean data)
-- Auto-responses are sent immediately (MCU thinks it's talking to real terminal)
-- Multi-chunk ANSI sequences handled correctly (carry buffer prevents missed queries)
+### set_terminal_emulation
+Enable/disable ANSI terminal emulation for MCU-based full-screen editors.
+Parameters: session_id (required), enabled (required), terminal_size (optional, e.g. {rows: 24, cols: 80})
+Auto-responds to ESC[6n and ESC[18t queries. ANSI queries stripped from output.
 
 ### close_session
 Close a session and clean up resources (stops reader, closes port safely).
@@ -7887,109 +7803,38 @@ Parameters:
 Returns: Success confirmation
 
 ### list_sessions
-List all active sessions with metadata.
+List all active sessions with metadata. Includes session_note if one was set at open time.
 
 Parameters: None
 
-Returns: Array of session information (bytes sent/received, runtime, etc.)
+Returns: Array of session information (session_id, endpoint, transport_type, runtime, bytes, session_note if set)
 
 ### get_session_info
-Get detailed information about a specific session (Phase 2B: Enhanced statistics!).
+Get detailed session statistics. Params: session_id (required)
+Returns: uptime, bytes sent/received, throughput, last activity age, worker status, session_note if set.
 
-Parameters:
-- session_id (required): Session to query
-
-Returns: Detailed session metadata and statistics
-- Phase 2B additions:
-  * session_uptime_formatted (HH:MM:SS)
-  * bytes_per_second_average (total throughput)
-  * last_activity_age_seconds (how long since last data?)
-  * worker_thread_alive (is worker still running?)
-
-### send_async (Phase 2C)
-Fire-and-forget async send with progress tracking. Perfect for large files.
-
-Parameters:
-- session_id (required): Session to send on
-- file_path (optional): Path to file to stream (bypasses AI context!)
-- data (optional): Inline data with control character support
-- operation_id (optional): Custom operation ID (auto-generated if not provided)
-
-Either file_path OR data is required.
-
-Use Cases:
-- Stream 10MB RML file to Roland MDX over hardware flow control
-- Send large firmware to device without blocking
-- Upload big data files to MCU storage
-
-Returns: operation_id, status="pending", message
-
+### send_async
+Fire-and-forget async send with progress tracking for large files.
+Params: session_id, file_path OR data, operation_id (optional)
 Use get_async_status to track progress, cancel_async to cancel.
 
-### get_async_status (Phase 2C)
-Query progress of an async operation.
+### get_async_status
+Query async operation progress. Params: session_id, operation_id
+Returns: status, percent_complete, bytes_processed, total_bytes, eta_seconds
 
-Parameters:
-- session_id (required): Session the operation is running on
-- operation_id (required): Operation to query
+### cancel_async
+Cancel an in-progress async operation. Params: session_id, operation_id
 
-Returns:
-- status: pending|in_progress|completed|cancelled|error
-- percent_complete: Progress percentage
-- bytes_processed: Bytes sent so far
-- total_bytes: Total bytes to send
-- elapsed_seconds: Time since start
-- eta_seconds: Estimated time to completion
-- error_message: If status is error
+### set_baud
+Change baud rate during active session. Params: session_id, baud_rate
 
-### cancel_async (Phase 2C)
-Cancel an in-progress async operation.
+### send_break
+Send serial BREAK signal. Params: session_id, duration (optional, default 0.25s)
 
-Parameters:
-- session_id (required): Session the operation is running on
-- operation_id (required): Operation to cancel
+### get_line_states
+Read serial control line states (CTS, DSR, RI, CD, DTR, RTS). Params: session_id
 
-Returns: Success confirmation
-
-### set_baud (Phase 2C)
-Change baud rate during an active session (runtime baud switching).
-
-Parameters:
-- session_id (required): Session to modify
-- baud_rate (required): New baud rate
-
-Returns: old_baud_rate, new_baud_rate, confirmation
-
-Use Case: Some devices require negotiation at one baud, then switch to higher speed.
-
-### send_break (Phase 2C)
-Send a serial BREAK signal (prolonged spacing condition).
-
-Parameters:
-- session_id (required): Session to send BREAK on
-- duration (optional): Duration in seconds, default 0.25
-
-Returns: Success confirmation
-
-Use Case: Some bootloaders and industrial devices use BREAK for signaling.
-
-### get_line_states (Phase 2C)
-Read current state of serial control lines (pins).
-
-Parameters:
-- session_id (required): Session to query
-
-Returns:
-- cts: Clear To Send (input)
-- dsr: Data Set Ready (input)
-- ri: Ring Indicator (input)
-- cd: Carrier Detect (input)
-- dtr: Data Terminal Ready (output, current state)
-- rts: Request To Send (output, current state)
-
-Use Case: Monitor hardware flow control state, debug wiring issues.
-
-### upgrade_to_tls (Phase 6A)
+### upgrade_to_tls
 Upgrade an existing plain connection to TLS/SSL encryption (STARTTLS pattern).
 
 Use this operation after negotiating STARTTLS with the server. The operation wraps
@@ -8016,336 +7861,211 @@ Returns:
 - tls_cert_subject: Certificate subject CN
 - tls_cert_fingerprint: SHA256 fingerprint
 
-Example (SMTP STARTTLS):
-```json
-// 1. Open plain SMTP connection
-{"operation": "open_session", "endpoint": "tcp://mail.example.com:25", "tool_unlock_token": "..."}
+Flow: open_session (plain) -> send STARTTLS -> read response -> upgrade_to_tls -> continue encrypted.
 
-// 2. Send EHLO and STARTTLS
-{"operation": "send_data", "session_id": "mcu_1", "data": "EHLO client.local\\r\\n", "tool_unlock_token": "..."}
-{"operation": "read_data", "session_id": "mcu_1", "tool_unlock_token": "..."}
-{"operation": "send_data", "session_id": "mcu_1", "data": "STARTTLS\\r\\n", "tool_unlock_token": "..."}
-{"operation": "read_data", "session_id": "mcu_1", "tool_unlock_token": "..."}
+### get_tls_info
+Get TLS connection details: protocol version, cipher, certificate info (subject, issuer, dates, fingerprint, SAN).
+Parameters: session_id (required)
 
-// 3. Upgrade to TLS
-{"operation": "upgrade_to_tls", "session_id": "mcu_1", "tls_verify": false, "tool_unlock_token": "..."}
+### sftp_put / sftp_get / sftp_list (SSH sessions only)
+SFTP file transfer over existing SSH sessions (separate channel, doesn't interrupt shell).
 
-// 4. Continue with encrypted connection
-{"operation": "send_data", "session_id": "mcu_1", "data": "EHLO client.local\\r\\n", "tool_unlock_token": "..."}
-```
+**sftp_put**: Upload file. Params: session_id, local_path, remote_path
+**sftp_get**: Download file. Params: session_id, remote_path, local_path
+**sftp_list**: List remote directory. Params: session_id, remote_path (optional)
 
-### get_tls_info (Phase 6A)
-Get detailed information about TLS connection and server certificate.
+Returns: bytes_transferred, elapsed_seconds, speed_kbps (put/get) or entries array (list)
 
-Returns comprehensive TLS connection details including protocol version, cipher suite,
-and full certificate information. Useful for security auditing and debugging.
+""".replace("{BS}", BS),
+        "man": """
+## Extended Documentation (man)
 
-Parameters:
-- session_id (required): Session to query
+This contains detailed documentation for less commonly used features.
+For core operations, use operation "readme".
 
-Returns:
-- tls_enabled: Whether TLS is active
-- tls_version: TLS protocol version (e.g., "TLSv1.3")
-- cipher: Cipher suite name
-- cipher_bits: Cipher strength in bits
-- certificate: Certificate details object:
-  - subject: Certificate subject (dict with CN, O, etc.)
-  - issuer: Certificate issuer (dict with CN, O, etc.)
-  - not_before: Validity start date
-  - not_after: Validity end date
-  - serial_number: Certificate serial number
-  - fingerprint_sha256: SHA256 fingerprint (colon-separated hex)
-  - san: List of Subject Alternative Names
-- verified: Whether certificate was verified
+## Bluetooth Transports (Classic BT + BLE)
 
-Example:
-```json
-{"operation": "get_tls_info", "session_id": "mcu_1", "tool_unlock_token": "..."}
-```
+### Feature Overview
+  * Classic Bluetooth (RFCOMM/SPP): `bt://AA:BB:CC:DD:EE:FF` endpoint format
+  * Bluetooth Low Energy (BLE/GATT): `ble://11:22:33:44:55:66` endpoint format
+  * BLE UART mode: Automatic Nordic UART Service detection for serial-like communication
+  * Discovery operations: `discover_bluetooth` and `discover_ble` with full service details
+  * PIN/pairing support for Classic Bluetooth
+  * Use cases: ESP32 Bluetooth, HC-05/HC-06 modules, BLE sensors, fitness trackers
+  * pybluez for Classic BT (pre-built wheels included, graceful fallback if missing)
+  * bleak for BLE (pure Python, auto-installs if missing)
+  * Cross-platform: Windows, Linux, macOS
 
-### sftp_put (Phase 5M)
-Upload a file to a remote server via SFTP. Only works with SSH transport sessions.
-
-The SFTP channel is separate from the interactive shell channel, so file transfers
-don't interfere with your terminal session.
+### discover_network
+Discover devices on local network via mDNS/DNS-SD (Bonjour).
+Similar to how Arduino IDE discovers network-enabled boards.
 
 Parameters:
-- session_id (required): SSH session to use
-- local_path (required): Path to local file to upload
-- remote_path (required): Destination path on remote server
+- service_types (optional): Array of DNS-SD service types to search for
+  Default: ['_telnet._tcp.local.', '_ssh._tcp.local.', '_arduino._tcp.local.', '_http._tcp.local.']
+- read_timeout (optional): How long to listen for mDNS responses in seconds (default 5.0)
 
 Returns:
-- bytes_transferred: Number of bytes uploaded
-- elapsed_seconds: Transfer time
-- speed_kbps: Transfer speed in KB/s
+- total_devices: Number of devices found
+- devices: Array of {name, hostname, ip, port, service, service_type}
 
-Example:
+**Platform Requirements:**
+- Windows: Requires Bonjour service (install iTunes or Bonjour Print Services)
+- Linux/WSL: Works out-of-box with Avahi daemon
+- macOS: Works out-of-box with native mDNS support
+
+**Example:**
 ```json
-{
-  "operation": "sftp_put",
-  "session_id": "mcu_1",
-  "local_path": "C:/firmware/app.bin",
-  "remote_path": "/home/user/firmware/app.bin",
-  "tool_unlock_token": "..."
-}
+{"operation": "discover_network", "tool_unlock_token": "..."}
+{"operation": "discover_network", "service_types": ["_ssh._tcp.local."], "read_timeout": 5.0, "tool_unlock_token": "..."}
 ```
 
-### sftp_get (Phase 5M)
-Download a file from a remote server via SFTP. Only works with SSH transport sessions.
+### bleak
+**Generic BLE (GATT) operations using python bleak library API directly.**
+
+Auto-manages BLE connections per device address - first operation creates a persistent
+connection, subsequent operations reuse it.
+
+**Supported Methods:**
+- `read_gatt_char` - Read a GATT characteristic once
+- `write_gatt_char` - Write to a GATT characteristic
+- `start_notify` - Subscribe to characteristic notifications (queues data)
+- `stop_notify` - Unsubscribe from notifications
+- `read_gatt_descriptor` - Read a GATT descriptor
+- `write_gatt_descriptor` - Write to a GATT descriptor
+- `get_services` - Get all services/characteristics from device
 
 Parameters:
-- session_id (required): SSH session to use
-- remote_path (required): Path to file on remote server
-- local_path (required): Destination path on local machine
+- address (required): BLE MAC address (e.g., "11:22:33:44:55:66")
+- method (required): Bleak method name (see supported methods above)
+- char_uuid (required for char operations): Characteristic UUID
+- service_uuid (optional): Service UUID to narrow down characteristic search
+- data (required for write operations): Data to write (string, bytes, or array of ints)
+- timeout (optional): Operation timeout in seconds (default 10.0)
 
-Returns:
-- bytes_transferred: Number of bytes downloaded
-- elapsed_seconds: Transfer time
-- speed_kbps: Transfer speed in KB/s
+**Returns:**
+- For `read_gatt_char`: {"value": bytes, "value_hex": "01 02 03"}
+- For `write_gatt_char`: {"success": true, "bytes_written": N}
+- For `start_notify`: {"success": true, "callback_id": "address:char_uuid"}
+- For `get_services`: {"services": [...]} with full service/characteristic tree
 
-Example:
+**Examples:**
 ```json
-{
-  "operation": "sftp_get",
-  "session_id": "mcu_1",
-  "remote_path": "/var/log/syslog",
-  "local_path": "C:/logs/remote_syslog.txt",
-  "tool_unlock_token": "..."
-}
+{"operation": "bleak", "address": "AA:BB:CC:DD:EE:FF", "method": "read_gatt_char", "char_uuid": "00002a37-0000-1000-8000-00805f9b34fb", "tool_unlock_token": "..."}
+{"operation": "bleak", "address": "11:22:33:44:55:66", "method": "write_gatt_char", "char_uuid": "12345678-1234-1234-1234-123456789abc", "data": [1, 2, 3], "tool_unlock_token": "..."}
+{"operation": "bleak", "address": "AA:BB:CC:DD:EE:FF", "method": "start_notify", "char_uuid": "00002a1c-0000-1000-8000-00805f9b34fb", "tool_unlock_token": "..."}
+{"operation": "bleak", "address": "AA:BB:CC:DD:EE:FF", "method": "get_services", "tool_unlock_token": "..."}
 ```
 
-### sftp_list (Phase 5M)
-List directory contents on a remote server via SFTP. Only works with SSH transport sessions.
+**Note:** This is separate from `open_session` with `ble://` endpoints. Use bleak for ad-hoc GATT operations, notifications, and multi-characteristic access. Use `ble://` for Nordic UART Service (serial-like streams).
+
+### bleak_get_notifications
+Poll for queued BLE notifications from a subscribed characteristic.
 
 Parameters:
-- session_id (required): SSH session to use
-- remote_path (optional): Path to directory (default: current directory ".")
+- callback_id (required): Callback ID from start_notify (format: "address:char_uuid")
+- timeout (optional): How long to wait for notifications (default 1.0 seconds)
+- max_notifications (optional): Maximum notifications to return (default 100)
 
-Returns:
-- entry_count: Number of entries found
-- entries: Array of file info objects:
-  - name: Filename
-  - size: File size in bytes
-  - is_dir: True if directory
-  - mtime: Modification time (Unix timestamp)
-  - mode: File permissions (octal string like "0755")
+Returns: notifications array of {timestamp, value, value_hex}, count, has_more
 
-Example:
+### bleak_disconnect
+Explicitly disconnect from a BLE device. Connections auto-close after 5 minutes of inactivity.
+Parameters: address (required)
+
+## Additional Transports
+
+### RFC2217 Transport (Remote Serial Port Control)
+  * `rfc2217://host:port` endpoint format (e.g., `rfc2217://192.168.1.100:2217`)
+  * Full RFC2217 COM-PORT-OPTION support (telnet + serial control)
+  * Control remote serial ports: DTR/RTS, baud rate, break signal
+  * Read modem state: CTS/DSR/RI/CD line states
+  * All serial operations work over network
+
+### Unix Domain Sockets & Named Pipes
+  * `unix:///path/to/socket` for Unix domain sockets (Linux/macOS)
+  * `pipe://\\\\.\\pipe\\name` for Windows named pipes
+  * `fifo:///path/to/fifo` for POSIX FIFOs
+  * Use case: Docker containers, databases, local services, legacy integration
+
+### Program/STDIO Transport
+  * `program://command` endpoint format (e.g., `program://python`, `program://bash`)
+  * Cross-platform PTY support (pty on POSIX, pywinpty on Windows)
+  * Full ANSI escape sequence support (colors, cursor movement)
+  * Use case: MCP tool testing, interactive REPLs, build monitoring, CLI automation
+
+## CRITICAL: Escaping and Multi-Line Content (Full Guide)
+
+**Escape processing:** The data field supports these escape sequences:
+{BS}r (CR), {BS}n (LF), {BS}t (TAB), {BS}xNN (hex byte), {BS}uNNNN (Unicode), {BS}{BS} (literal backslash), {BS}^ (literal caret), ^C/^D/etc (control chars).
+
+**JSON double-escaping:** Since your tool call is JSON, backslashes need double-escaping.
+Write `{BS}{BS}r{BS}{BS}n` in your JSON string to get `{BS}r{BS}n` after JSON parsing, which our parser then converts to CR+LF.
+Writing a plain JSON `{BS}n` also works (JSON makes it a real newline byte, sent as-is), but
+every newline acts as pressing Enter in a terminal - see multi-line warning below.
+
+**Sending multi-line content (scripts, config files, etc.):**
+Every {BS}r{BS}n sent to a terminal acts as pressing Enter. If you send a multi-line bash script
+or Python function, each line executes independently as a separate command, causing syntax errors.
+
+Solutions (best to worst):
+
+1. **sftp_put** (SSH sessions - BEST for scripts/files):
+   Write content to a local temp file, then upload via SFTP and execute:
+   sftp_put local_path="/tmp/myscript.py" remote_path="/tmp/myscript.py"
+   send_data data="python3 /tmp/myscript.py{BS}r{BS}n"
+
+2. **heredoc** (bash/sh sessions):
+   data="cat > /tmp/script.sh << 'EOF'{BS}r{BS}nline1{BS}r{BS}nline2{BS}r{BS}nEOF{BS}r{BS}n"
+
+3. **base64** (any session with base64 command):
+   data="echo 'BASE64STRING' | base64 -d > /tmp/script.sh{BS}r{BS}n"
+
+4. **printf** (any POSIX shell):
+   data="printf 'line1{BS}{BS}nline2{BS}{BS}nline3' > /tmp/file.txt{BS}r{BS}n"
+
+5. **Line-by-line** (interactive REPLs only):
+   Send each line with {BS}r{BS}n and let the REPL prompt for more.
+   For MicroPython, use paste mode (^E) to enter multi-line blocks.
+
+## Additional open_session Examples
+
 ```json
-{
-  "operation": "sftp_list",
-  "session_id": "mcu_1",
-  "remote_path": "/home/user/firmware/",
-  "tool_unlock_token": "..."
-}
-```
+// SSH with key file (~ is auto-expanded on all platforms including Windows)
+{"operation": "open_session", "endpoint": "ssh://user@server.com:22", "ssh_key_filename": "~/.ssh/id_ed25519", "tool_unlock_token": "..."}
 
-Use Cases:
-- Upload firmware binaries to remote build servers
-- Download log files for analysis
-- Manage files on remote embedded Linux systems
-- Deploy configuration files
-- Backup remote data
+// SSH with auto-reconnect and session note (survives network drops, agents can re-identify sessions)
+{"operation": "open_session", "endpoint": "ssh://deploy@prod:22", "ssh_key_filename": "~/.ssh/id_ed25519", "ssh_allow_unknown_hosts": true, "auto_reconnect": true, "session_note": "Agent-3 prod deploy", "tool_unlock_token": "..."}
 
-## Input Examples
+// WebSocket with explicit text mode (for JSON-RPC, CDP, text APIs)
+{"operation": "open_session", "endpoint": "ws://api.example.com/rpc", "ws_mode": "text", "tool_unlock_token": "..."}
 
-1. Get documentation:
-```json
-{
-  "input": {"operation": "readme"}
-}
-```
+// WebSocket with custom headers (authentication)
+{"operation": "open_session", "endpoint": "ws://api.example.com/ws", "ws_headers": {"Authorization": "Bearer token123"}, "tool_unlock_token": "..."}
 
-2. List available ports:
-```json
-{
-  "input": {
-    "operation": "list_ports",
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
+// Auto-reconnect with faster retry for time-critical boot log capture
+{"operation": "open_session", "endpoint": "COM22", "auto_reconnect": true, "auto_reconnect_interval_ms": 100, "tool_unlock_token": "..."}
 
-3. Open a new session (ESP32 at 115200 baud):
-```json
-{
-  "input": {
-    "operation": "open_session",
-    "endpoint": "COM6",
-    "baud_rate": 115200,
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
+// TLS over telnet (encrypted telnet)
+{"operation": "open_session", "endpoint": "telnet://device.local:992", "use_tls": true, "tls_verify": false, "tool_unlock_token": "..."}
 
-4. Send Ctrl-C to interrupt (enter REPL):
-```json
-{
-  "input": {
-    "operation": "send_data",
-    "session_id": "mcu_1",
-    "data": "^C",
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
+// Classic Bluetooth
+{"operation": "open_session", "endpoint": "bt://AA:BB:CC:DD:EE:FF", "tool_unlock_token": "..."}
 
-5. Send REPL command (NOTE: use {BS}r{BS}n, not just {BS}n):
-```json
-{
-  "input": {
-    "operation": "send_data",
-    "session_id": "mcu_1",
-    "data": "2+2{BS}r{BS}n",
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
+// BLE UART
+{"operation": "open_session", "endpoint": "ble://11:22:33:44:55:66", "tool_unlock_token": "..."}
 
-5b. Send import statement in REPL:
-```json
-{
-  "input": {
-    "operation": "send_data",
-    "session_id": "mcu_1",
-    "data": "import sys{BS}r{BS}n",
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
+// Unix socket
+{"operation": "open_session", "endpoint": "unix:///var/run/docker.sock", "tool_unlock_token": "..."}
 
-6. Read response (wait up to 2 seconds):
-```json
-{
-  "input": {
-    "operation": "read_data",
-    "session_id": "mcu_1",
-    "read_timeout": 2.0,
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
+// Named pipe (Windows)
+{"operation": "open_session", "endpoint": "pipe://\\\\.\\pipe\\mypipe", "tool_unlock_token": "..."}
 
-6b. Wait for specific pattern (Phase 2B - NEW!):
-```json
-{
-  "input": {
-    "operation": "wait_for_pattern",
-    "session_id": "mcu_1",
-    "pattern": ">>>",
-    "read_timeout": 5.0,
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
+// Program/STDIO
+{"operation": "open_session", "endpoint": "program://python", "tool_unlock_token": "..."}
 
-6c. Read with idle timeout (Phase 4B - NEW!):
-```json
-{
-  "input": {
-    "operation": "read_data",
-    "session_id": "mcu_1",
-    "read_timeout": 3600,
-    "idle_timeout_seconds": 30,
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
-// Reads for up to 1 hour, but stops after 30 seconds of silence
-// Perfect for: AI responses, compilation logs, test suites, unpredictable streams
-
-6d. Wait for pattern OR silence (Phase 4B - NEW!):
-```json
-{
-  "input": {
-    "operation": "wait_for_pattern",
-    "session_id": "mcu_1",
-    "pattern": "DONE",
-    "read_timeout": 300,
-    "idle_timeout_seconds": 10,
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
-// Wait up to 5 minutes for "DONE", but also stop if 10 seconds of silence
-// Check idle_timeout_reached in result to know which condition triggered
-
-7. List all active sessions:
-```json
-{
-  "input": {
-    "operation": "list_sessions",
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
-
-8. Get session details:
-```json
-{
-  "input": {
-    "operation": "get_session_info",
-    "session_id": "mcu_1",
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
-
-9. Close session (safely closes port):
-```json
-{
-  "input": {
-    "operation": "close_session",
-    "session_id": "mcu_1",
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
-
-10. Stream large file async (Phase 2C - Roland MDX example):
-```json
-{
-  "input": {
-    "operation": "open_session",
-    "endpoint": "COM4",
-    "baud_rate": 9600,
-    "hardware_flow_control": true,
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
-Then send the file:
-```json
-{
-  "input": {
-    "operation": "send_async",
-    "session_id": "mcu_2",
-    "file_path": "C:/Users/cnd/models/part.rml",
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
-Track progress:
-```json
-{
-  "input": {
-    "operation": "get_async_status",
-    "session_id": "mcu_2",
-    "operation_id": "async_1234567890",
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
-```
-
-11. Check line states (Phase 2C):
-```json
-{
-  "input": {
-    "operation": "get_line_states",
-    "session_id": "mcu_1",
-    "tool_unlock_token": """ + f'"{TOOL_UNLOCK_TOKEN}"' + """
-  }
-}
+// RFC2217
+{"operation": "open_session", "endpoint": "rfc2217://192.168.1.100:2217", "tool_unlock_token": "..."}
 ```
 
 """.replace("{BS}", BS)
@@ -8362,9 +8082,8 @@ def validate_parameters(input_param: Dict) -> Tuple[Optional[str], Dict]:
     properties = real_params_schema["properties"]
     required = real_params_schema.get("required", [])
     
-    # For readme operation, don't require token
     operation = input_param.get("operation")
-    if operation == "readme":
+    if operation in ("readme", "man"):
         required = ["operation"]
     
     # Check for unexpected parameters
@@ -8387,13 +8106,17 @@ def validate_parameters(input_param: Dict) -> Tuple[Optional[str], Dict]:
             value = input_param[param_name]
             expected_type = param_schema.get("type")
             
-            # Type validation
+            # Type validation. Note: bool is a subclass of int, so integer/number
+            # checks must explicitly reject bool, otherwise baud_rate=true etc. would
+            # sail through and later become baudrate=1 (review A6).
             if expected_type == "string" and not isinstance(value, str):
                 return f"Parameter '{param_name}' must be a string, got {type(value).__name__}", {}
             elif expected_type == "boolean" and not isinstance(value, bool):
                 return f"Parameter '{param_name}' must be a boolean, got {type(value).__name__}", {}
-            elif expected_type == "integer" and not isinstance(value, int):
+            elif expected_type == "integer" and (not isinstance(value, int) or isinstance(value, bool)):
                 return f"Parameter '{param_name}' must be an integer, got {type(value).__name__}", {}
+            elif expected_type == "number" and (not isinstance(value, (int, float)) or isinstance(value, bool)):
+                return f"Parameter '{param_name}' must be a number, got {type(value).__name__}", {}
             
             # Enum validation
             if "enum" in param_schema:
@@ -8413,24 +8136,62 @@ def validate_parameters(input_param: Dict) -> Tuple[Optional[str], Dict]:
     return None, validated
 
 def readme(with_readme: bool = True) -> str:
-    """Return tool documentation"""
+    """Return tool documentation as JSON with description as array of lines."""
     try:
         if not with_readme:
             return ''
-        
+
         MCPLogger.log(TOOL_LOG_NAME, "Processing readme request")
         return "\n\n" + json.dumps({
-            "description": TOOLS[0]["readme"],
+            "description": multiline_text_to_description_array(TOOLS[0]["readme"]),
             "parameters": TOOLS[0]["real_parameters"]
         }, indent=2)
     except Exception as e:
         MCPLogger.log(TOOL_LOG_NAME, f"Error processing readme request: {str(e)}")
         return ''
 
+def man_page() -> str:
+    """Return extended documentation (Bluetooth, BLE, escaping guide, extra examples) as JSON with description as array of lines."""
+    try:
+        MCPLogger.log(TOOL_LOG_NAME, "Processing man request")
+        return "\n\n" + json.dumps({
+            "description": multiline_text_to_description_array(TOOLS[0]["man"])
+        }, indent=2)
+    except Exception as e:
+        MCPLogger.log(TOOL_LOG_NAME, f"Error processing man request: {str(e)}")
+        return ''
+
 def create_error_response(error_msg: str, with_readme: bool = True) -> Dict:
     """Create an error response that optionally includes the tool documentation"""
     MCPLogger.log(TOOL_LOG_NAME, f"Error: {error_msg}")
     return {"content": [{"type": "text", "text": f"{error_msg}{readme(with_readme)}"}], "isError": True}
+
+
+def _sync_worker_request(session: 'session_container_with_log_file', command_tuple: tuple,
+                         response_timeout: float):
+    """Send a command to the worker and wait for its reply, serialized per session.
+
+    Holds session.response_lock so two MCP handler threads on the same session
+    cannot each read the other's reply off the shared response_queue (review A10).
+    Stale replies left by a previously timed-out caller are drained first. Raises
+    queue.Empty on lock-acquire timeout or response timeout (callers already map
+    that to a clean timeout error).
+    """
+    lock = session.response_lock
+    if lock is not None and not lock.acquire(timeout=response_timeout):
+        raise queue.Empty()
+    try:
+        # Drain any stale responses from a previous timed-out round-trip
+        while True:
+            try:
+                session.response_queue.get_nowait()
+            except queue.Empty:
+                break
+        session.command_queue.put(command_tuple)
+        return session.response_queue.get(timeout=response_timeout)
+    finally:
+        if lock is not None:
+            lock.release()
 
 # ============================================================================
 # OPERATION HANDLERS
@@ -8458,6 +8219,8 @@ def handle_open_session(params: Dict) -> Dict:
         ssh_username = params.get("ssh_username")  # Can also come from endpoint
         ssh_password = params.get("ssh_password")
         ssh_key_filename = params.get("ssh_key_filename")
+        if ssh_key_filename:
+            ssh_key_filename = normalize_local_file_path(ssh_key_filename)
         ssh_key_data = params.get("ssh_key_data")
         ssh_key_password = params.get("ssh_key_password")
         ssh_allow_unknown_hosts = params.get("ssh_allow_unknown_hosts", False)
@@ -8482,6 +8245,26 @@ def handle_open_session(params: Dict) -> Dict:
         except ValueError as e:
             return create_error_response(f"Invalid endpoint format: {e}", with_readme=False)
         
+        # A12 fix: auto_reconnect cannot recreate these transports (no saved
+        # connection state / process is lost), so the worker's reconnect gate would
+        # silently never fire. Reject up-front with a clear message instead.
+        if auto_reconnect and transport_type in ("unix", "pipe", "program"):
+            return create_error_response(
+                f"auto_reconnect is not supported for {transport_type} transport "
+                f"(its connection/process state cannot be recreated). Open without auto_reconnect.",
+                with_readme=False
+            )
+        
+        # A14 fix: cap concurrent sessions so a confused/malicious caller cannot
+        # exhaust threads, file descriptors and open log handles.
+        with _session_cache_lock:
+            if len(_active_sessions_cache) >= MAX_ACTIVE_SESSIONS:
+                return create_error_response(
+                    f"Too many active terminal sessions ({len(_active_sessions_cache)}/{MAX_ACTIVE_SESSIONS}). "
+                    f"Close some sessions before opening new ones.",
+                    with_readme=False
+                )
+        
         # Phase 2E: Guard against duplicate opens (expert recommendation)
         with _session_cache_lock:
             for existing_session_id, existing_session in _active_sessions_cache.items():
@@ -8494,11 +8277,22 @@ def handle_open_session(params: Dict) -> Dict:
         
         MCPLogger.log(TOOL_LOG_NAME, f"Opening session for endpoint: {endpoint} (transport: {transport_type})")
         MCPLogger.log(TOOL_LOG_NAME, f"DEBUG: transport_type={repr(transport_type)}, connection_params={repr(connection_params)}")
-        
+
+        # Allow agent to request a specific session_id
+        requested_session_id = params.get("session_id")
+
         # Create session (Phase 1 infrastructure)
-        session_id = create_new_session(endpoint, transport_type)
+        try:
+            session_id = create_new_session(endpoint, transport_type, requested_session_id)
+        except ValueError as e:
+            return create_error_response(str(e), with_readme=False)
         session = get_session(session_id)
         
+        # Store agent-supplied session label
+        session_note = params.get("session_note", "")
+        if session_note:
+            session.metadata.session_note = session_note
+
         # Phase 5L: Store auto_reconnect settings in metadata
         session.metadata.auto_reconnect_enabled = auto_reconnect
         session.metadata.auto_reconnect_interval_ms = auto_reconnect_interval_ms
@@ -8658,7 +8452,36 @@ def handle_open_session(params: Dict) -> Dict:
                 
                 if not username:
                     raise ValueError("SSH requires username (in endpoint ssh://user@host:port or via ssh_username parameter)")
-                
+
+                # Store connection params for auto-reconnect
+                session.connection_params = {
+                    "transport_type": "ssh",
+                    "host": host,
+                    "port": port,
+                    "username": username,
+                    "password": ssh_password,
+                    "key_filename": ssh_key_filename,
+                    "key_data": ssh_key_data,
+                    "key_password": ssh_key_password,
+                    "allow_unknown_hosts": ssh_allow_unknown_hosts,
+                    "connect_timeout": connect_timeout,
+                    "terminal_type": ssh_terminal_type,
+                    "terminal_width": ssh_terminal_width,
+                    "terminal_height": ssh_terminal_height,
+                    "compression": ssh_compression,
+                    "otp_secret": ssh_otp_secret,
+                    "otp_code": ssh_otp_code,
+                    "allow_agent": ssh_allow_agent,
+                }
+
+                # B7 fix: reconnect is the only consumer of these saved params; when
+                # auto_reconnect is off, don't retain raw SSH secrets in process
+                # memory for the life of the session (the initial connect below uses
+                # the local ssh_* variables, not connection_params).
+                if not auto_reconnect:
+                    for _secret_key in ("password", "key_data", "key_password", "otp_secret", "otp_code"):
+                        session.connection_params[_secret_key] = None
+
                 MCPLogger.log(TOOL_LOG_NAME, f"Opening SSH connection: {username}@{host}:{port} (timeout: {connect_timeout}s)")
                 
                 # Create SSH transport (connection + auth + PTY happens in __init__)
@@ -8699,7 +8522,9 @@ def handle_open_session(params: Dict) -> Dict:
                 elevation_password = params.get("elevation_password")
                 
                 elevation_status = " (elevated)" if elevated else ""
-                MCPLogger.log(TOOL_LOG_NAME, f"Spawning program{elevation_status}: {command} {program_args} (cwd: {program_cwd or 'current'})")
+                # Mask secret-bearing args in this log line too (review B5)
+                _masked_args = ProgramTransport._sanitize_args_for_logging(program_args) if program_args else []
+                MCPLogger.log(TOOL_LOG_NAME, f"Spawning program{elevation_status}: {command} {_masked_args} (cwd: {program_cwd or 'current'})")
                 
                 # Create program transport (process spawns in __init__)
                 session.transport = ProgramTransport(
@@ -8837,7 +8662,9 @@ def handle_open_session(params: Dict) -> Dict:
             # Phase 2D: Create queues for unified worker thread
             session.command_queue = queue.Queue()  # MCP -> Worker commands
             session.response_queue = queue.Queue()  # Worker -> MCP responses
-            session.output_queue = queue.Queue()  # Worker -> MCP data stream
+            # Bounded output queue: worker drops oldest on overflow so an undrained
+            # queue cannot grow without limit (review A8)
+            session.output_queue = queue.Queue(maxsize=MAX_OUTPUT_QUEUE_ITEMS)  # Worker -> MCP data stream
             MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} created: output_queue_id={id(session.output_queue)}")
             
             # Phase 2D: Start single unified worker thread (owns the port!)
@@ -8860,7 +8687,10 @@ def handle_open_session(params: Dict) -> Dict:
                 "transport_type": transport_type,
                 "log_file_path": str(session.metadata.log_file_path),
             }
-            
+
+            if session_note:
+                result["session_note"] = session_note
+
             # Phase 5L: Include auto_reconnect in result if enabled
             if auto_reconnect:
                 result["auto_reconnect"] = True
@@ -9025,7 +8855,8 @@ def handle_open_session(params: Dict) -> Dict:
                 # Set up queues for worker thread
                 session.command_queue = queue.Queue()
                 session.response_queue = queue.Queue()
-                session.output_queue = queue.Queue()
+                # Bounded output queue (drop-oldest on overflow) - review A8
+                session.output_queue = queue.Queue(maxsize=MAX_OUTPUT_QUEUE_ITEMS)
                 MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id} created in reconnect mode: output_queue_id={id(session.output_queue)}")
                 
                 # Start worker thread (will immediately enter reconnect loop)
@@ -9053,6 +8884,8 @@ def handle_open_session(params: Dict) -> Dict:
                     "initial_connection_error": initial_connection_error,
                     "message": f"Session {session_id} created in auto-reconnect mode. Waiting for {endpoint} to become available..."
                 }
+                if session_note:
+                    result["session_note"] = session_note
                 
                 return {
                     "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
@@ -9173,9 +9006,12 @@ def handle_get_session_info(params: Dict) -> Dict:
                 "log_file_path": str(session.metadata.log_file_path),
                 "log_file_size_bytes": session.metadata.log_file_size_bytes,
                 "is_active": session.metadata.is_active,
-                "worker_thread_alive": worker_thread_alive  # Phase 2B
+                "worker_thread_alive": worker_thread_alive,  # Phase 2B
             }
-            
+
+            if session.metadata.session_note:
+                result["session_note"] = session.metadata.session_note
+
             # Phase 5L: Include auto_reconnect status if enabled
             if session.metadata.auto_reconnect_enabled:
                 result["auto_reconnect"] = {
@@ -9230,6 +9066,8 @@ def handle_discover_network(params: Dict) -> Dict:
         read_timeout = params.get("read_timeout", 5.0)
         if not isinstance(read_timeout, (int, float)) or read_timeout <= 0:
             return create_error_response("Parameter 'read_timeout' must be a positive number", with_readme=False)
+        # A14/D8: cap discovery duration so it cannot pin a worker thread for a long time
+        read_timeout = min(read_timeout, MAX_DISCOVERY_DURATION_SECONDS)
         
         # Perform discovery
         devices = discover_network_devices(service_types=service_types, timeout_seconds=read_timeout)
@@ -9279,6 +9117,8 @@ def handle_discover_bluetooth(params: Dict) -> Dict:
         duration = params.get("duration", 10.0)
         if not isinstance(duration, (int, float)) or duration <= 0:
             return create_error_response("Parameter 'duration' must be a positive number", with_readme=False)
+        # A14: cap scan duration so a large value cannot pin a worker/handler thread
+        duration = min(duration, MAX_DISCOVERY_DURATION_SECONDS)
         
         # Optional: filter by service (default None to see ALL devices - hardware hackers want to see everything!)
         service = params.get("service", None)
@@ -9402,6 +9242,8 @@ def handle_discover_ble(params: Dict) -> Dict:
         duration = params.get("duration", 10.0)
         if not isinstance(duration, (int, float)) or duration <= 0:
             return create_error_response("Parameter 'duration' must be a positive number", with_readme=False)
+        # A14: cap scan duration so a large value cannot pin a worker/handler thread
+        duration = min(duration, MAX_DISCOVERY_DURATION_SECONDS)
         
         # Optional: include full service/characteristic details (default True)
         include_services = params.get("include_services", True)
@@ -9623,11 +9465,9 @@ def handle_send_data(params: Dict) -> Dict:
             # Phase 2E: Get configurable timeout (default 5.0s)
             response_timeout = params.get("response_timeout", 5.0)
             
-            # Send write command to worker
-            session.command_queue.put(("write", bytes_to_send))
-            
-            # Wait for response from worker (synchronous operation)
-            status, bytes_sent = session.response_queue.get(timeout=response_timeout)
+            # Send write command to worker and wait for its reply (serialized so
+            # concurrent handlers can't steal each other's responses - review A10)
+            status, bytes_sent = _sync_worker_request(session, ("write", bytes_to_send), response_timeout)
             
             if status != "ok":
                 return create_error_response(f"Worker thread error: {bytes_sent}", with_readme=False)
@@ -9667,6 +9507,10 @@ def handle_wait_for_pattern(params: Dict) -> Dict:
         session_id = params.get("session_id")
         pattern = params.get("pattern")
         read_timeout = params.get("read_timeout", 5.0)
+        # A14/C5: cap the blocking wait below the server's ~270s tool timeout so a
+        # huge read_timeout cannot pin an MCP worker thread past the point where the
+        # AI gets its response. For longer waits, poll repeatedly or use idle_timeout.
+        read_timeout = min(read_timeout, MAX_READ_TIMEOUT_SECONDS)
         idle_timeout_seconds = params.get("idle_timeout_seconds")  # Phase 4B: Optional idle timeout
         max_bytes = params.get("max_bytes", 65536)  # 64KB default limit
         use_regex = params.get("use_regex", False)
@@ -9729,8 +9573,6 @@ def handle_wait_for_pattern(params: Dict) -> Dict:
             try:
                 # Try to get data from queue
                 msg_type, msg_data = session.output_queue.get(timeout=min(remaining_time, 0.1))
-                data_len = len(msg_data) if msg_type == 'data' else len(str(msg_data))
-                MCPLogger.log(TOOL_LOG_NAME, f"QUEUE GET session={session_id} type={msg_type} len={data_len} qsize={session.output_queue.qsize()}")
                 
                 if msg_type == 'data':
                     collected_data.extend(msg_data)
@@ -9751,7 +9593,13 @@ def handle_wait_for_pattern(params: Dict) -> Dict:
                     
                 elif msg_type == 'error':
                     return create_error_response(f"Serial error: {msg_data}", with_readme=False)
-                    
+
+                elif msg_type in ('reconnect_start', 'reconnect_success', 'port_missing'):
+                    notice = f"\n{msg_data}\n".encode('utf-8')
+                    collected_data.extend(notice)
+                    last_data_time = time.time()
+                    got_data = True
+
             except queue.Empty:
                 # No data available, continue waiting or timeout
                 continue
@@ -9795,6 +9643,8 @@ def handle_read_data(params: Dict) -> Dict:
     try:
         session_id = params.get("session_id")
         read_timeout = params.get("read_timeout", 1.0)
+        # A14/C5: cap below the server's ~270s tool timeout (see wait_for_pattern)
+        read_timeout = min(read_timeout, MAX_READ_TIMEOUT_SECONDS)
         idle_timeout_seconds = params.get("idle_timeout_seconds")  # Phase 4B: Optional idle timeout
         include_hex = params.get("include_hex", False)  # Optional hex output (default False to reduce bandwidth)
         max_bytes = params.get("max_bytes", 65536)  # 64KB default limit
@@ -9841,8 +9691,6 @@ def handle_read_data(params: Dict) -> Dict:
             try:
                 # Try to get data from queue
                 msg_type, msg_data = session.output_queue.get(timeout=min(remaining_time, 0.1))
-                data_len = len(msg_data) if msg_type == 'data' else len(str(msg_data))
-                MCPLogger.log(TOOL_LOG_NAME, f"QUEUE GET session={session_id} type={msg_type} len={data_len} qsize={session.output_queue.qsize()}")
                 
                 if msg_type == 'data':
                     collected_data.extend(msg_data)
@@ -9850,7 +9698,13 @@ def handle_read_data(params: Dict) -> Dict:
                     got_data = True
                 elif msg_type == 'error':
                     return create_error_response(f"Serial error: {msg_data}", with_readme=False)
-                    
+
+                elif msg_type in ('reconnect_start', 'reconnect_success', 'port_missing'):
+                    notice = f"\n{msg_data}\n".encode('utf-8')
+                    collected_data.extend(notice)
+                    last_data_time = time.time()
+                    got_data = True
+
             except queue.Empty:
                 # No data available, continue waiting or timeout
                 if got_data:
@@ -9898,6 +9752,8 @@ def handle_send_async(params: Dict) -> Dict:
     try:
         session_id = params.get("session_id")
         file_path = params.get("file_path")
+        if file_path:
+            file_path = normalize_local_file_path(file_path)
         data = params.get("data")
         operation_id = params.get("operation_id", f"async_{int(time.time()*1000)}")
         
@@ -10063,8 +9919,7 @@ def handle_set_baud(params: Dict) -> Dict:
             # Phase 2E: Get configurable timeout
             response_timeout = params.get("response_timeout", 5.0)
             
-            session.command_queue.put(("set_baud", baud_rate))
-            status, baud_info = session.response_queue.get(timeout=response_timeout)
+            status, baud_info = _sync_worker_request(session, ("set_baud", baud_rate), response_timeout)
             
             if status != "ok":
                 return create_error_response(f"Worker thread error: {baud_info}", with_readme=False)
@@ -10114,8 +9969,7 @@ def handle_send_break(params: Dict) -> Dict:
             # Phase 2E: Get configurable timeout
             response_timeout = params.get("response_timeout", 5.0)
             
-            session.command_queue.put(("send_break", duration))
-            status, _ = session.response_queue.get(timeout=response_timeout)
+            status, _ = _sync_worker_request(session, ("send_break", duration), response_timeout)
             
             if status != "ok":
                 return create_error_response(f"Worker thread error", with_readme=False)
@@ -10161,8 +10015,7 @@ def handle_get_line_states(params: Dict) -> Dict:
             # Phase 2E: Get configurable timeout
             response_timeout = params.get("response_timeout", 5.0)
             
-            session.command_queue.put(("get_line_states",))
-            status, states = session.response_queue.get(timeout=response_timeout)
+            status, states = _sync_worker_request(session, ("get_line_states",), response_timeout)
             
             if status != "ok":
                 return create_error_response(f"Worker thread error", with_readme=False)
@@ -10234,25 +10087,38 @@ def handle_upgrade_to_tls(params: Dict) -> Dict:
         MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id}: Upgrading to TLS (verify={tls_verify}, hostname={tls_server_hostname})")
         
         try:
-            # Wrap current transport with TLS
-            old_transport = session.transport
-            session.transport = TLSWrapper(
-                old_transport,
-                verify_cert=tls_verify,
-                server_hostname=tls_server_hostname
-            )
+            # A11 fix: do the TLS wrap on the worker thread (which owns the
+            # transport) instead of mutating session.transport here while the
+            # worker may be inside transport.read() - that was a socket data race.
+            response_timeout = params.get("response_timeout", 15.0)
+            try:
+                status, payload = _sync_worker_request(
+                    session, ("upgrade_to_tls", tls_verify, tls_server_hostname), response_timeout
+                )
+            except queue.Empty:
+                return create_error_response("Timeout waiting for TLS upgrade on worker thread", with_readme=False)
             
-            # Update metadata
+            if status != "ok":
+                MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id}: TLS upgrade failed: {payload}")
+                return create_error_response(f"TLS upgrade failed: {payload}", with_readme=False)
+            
+            tls_info = payload
+            
+            # Update metadata (worker already swapped session.transport)
             session.metadata.tls_enabled = True
-            tls_info = session.transport.get_tls_info()
             session.metadata.tls_cert_fingerprint = tls_info.get("fingerprint_sha256", "")
             subject = tls_info.get("subject", {})
             session.metadata.tls_cert_subject = subject.get("commonName", "") if isinstance(subject, dict) else ""
             
-            # Update connection params for auto-reconnect
-            session.connection_params["use_tls"] = True
-            session.connection_params["tls_verify"] = tls_verify
-            session.connection_params["tls_server_hostname"] = tls_server_hostname
+            # D7 fix: A STARTTLS upgrade cannot be replayed automatically on
+            # reconnect (it needs the plaintext negotiation first). Do NOT set
+            # use_tls here (that would make auto-reconnect attempt a DIRECT TLS
+            # handshake on a plain port and fail). Mark it as starttls so
+            # create_transport_from_params leaves reconnect as a plain connection.
+            if session.connection_params is not None:
+                session.connection_params["tls_mode"] = "starttls"
+                session.connection_params["tls_verify"] = tls_verify
+                session.connection_params["tls_server_hostname"] = tls_server_hostname
             
             MCPLogger.log(TOOL_LOG_NAME, f"Session {session_id}: TLS upgrade successful (protocol: {tls_info.get('tls_version', 'unknown')})")
             
@@ -10365,6 +10231,8 @@ def handle_sftp_put(params: Dict) -> Dict:
     try:
         session_id = params.get("session_id")
         local_path = params.get("local_path")
+        if local_path:
+            local_path = normalize_local_file_path(local_path)
         remote_path = params.get("remote_path")
         
         if not session_id:
@@ -10429,6 +10297,8 @@ def handle_sftp_get(params: Dict) -> Dict:
         session_id = params.get("session_id")
         remote_path = params.get("remote_path")
         local_path = params.get("local_path")
+        if local_path:
+            local_path = normalize_local_file_path(local_path)
         
         if not session_id:
             return create_error_response("Parameter 'session_id' is required for sftp_get", with_readme=False)
@@ -10587,12 +10457,10 @@ def handle_send_sequence(params: Dict) -> Dict:
             "async": is_async
         }
         
-        # Send to worker thread
-        session.command_queue.put(("send_sequence", sequence_id, sequence, options_dict))
-        
-        # MUST-DO #6: If async, return immediately
+        # MUST-DO #6: If async, return immediately (fire-and-forget). The async
+        # ("ok", started) worker reply is drained by the next serialized command.
         if is_async:
-            # Store in active_sequences for later queries
+            session.command_queue.put(("send_sequence", sequence_id, sequence, options_dict))
             return {
                 "content": [{"type": "text", "text": json.dumps({
                     "success": True,
@@ -10604,11 +10472,30 @@ def handle_send_sequence(params: Dict) -> Dict:
                 "isError": False
             }
         
-        # Blocking mode: Wait for sequence to complete
+        # Blocking mode: acquire response_lock BEFORE enqueuing so the whole
+        # enqueue+wait round-trip is serialized and no other handler's command or
+        # response can interleave on the shared response_queue (review A10).
         response_timeout = params.get("response_timeout", options_dict["timeout"] + 5.0)
         
         try:
-            msg_type, result = session.response_queue.get(timeout=response_timeout)
+            acquired = session.response_lock.acquire(timeout=response_timeout) if session.response_lock else True
+            if not acquired:
+                return create_error_response(
+                    f"Timeout waiting for session command lock (another command in progress)",
+                    with_readme=False
+                )
+            try:
+                # Drain any stale replies from a previous timed-out caller
+                while True:
+                    try:
+                        session.response_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                session.command_queue.put(("send_sequence", sequence_id, sequence, options_dict))
+                msg_type, result = session.response_queue.get(timeout=response_timeout)
+            finally:
+                if session.response_lock:
+                    session.response_lock.release()
             
             if msg_type == "sequence_success":
                 return {
@@ -10688,24 +10575,20 @@ def handle_cancel_sequence(params: Dict) -> Dict:
         if not session:
             return create_error_response(f"Session {session_id} not found", with_readme=False)
         
-        # Send cancel command to worker (out-of-band, processed even during sequence)
+        # Send cancel command to worker (out-of-band, processed even during a
+        # sequence). Fire-and-forget: we must NOT read the shared response_queue
+        # here - a blocking send_sequence caller holds response_lock and is waiting
+        # for the sequence result, so consuming the queue would race/deadlock with
+        # it. The cancellation result is delivered to that blocking caller (A10).
         session.command_queue.put(("cancel_sequence",))
         
-        # Wait for acknowledgment
-        response_timeout = params.get("response_timeout", 5.0)
-        
-        try:
-            status, _ = session.response_queue.get(timeout=response_timeout)
-            
-            return {
-                "content": [{"type": "text", "text": json.dumps({
-                    "success": True,
-                    "message": "Cancel signal sent to worker thread"
-                }, indent=2)}],
-                "isError": False
-            }
-        except queue.Empty:
-            return create_error_response("Timeout waiting for cancel acknowledgment", with_readme=False)
+        return {
+            "content": [{"type": "text", "text": json.dumps({
+                "success": True,
+                "message": "Cancel signal sent to worker thread"
+            }, indent=2)}],
+            "isError": False
+        }
     
     except Exception as e:
         return create_error_response(f"Error in cancel_sequence: {str(e)}", with_readme=False)
@@ -10724,14 +10607,11 @@ def handle_set_terminal_emulation(params: Dict) -> Dict:
         if not session:
             return create_error_response(f"Session {session_id} not found", with_readme=False)
         
-        # Send to worker thread
-        session.command_queue.put(("set_terminal_emulation", enabled, terminal_size))
-        
         # Wait for response
         response_timeout = params.get("response_timeout", 5.0)
         
         try:
-            status, result = session.response_queue.get(timeout=response_timeout)
+            status, result = _sync_worker_request(session, ("set_terminal_emulation", enabled, terminal_size), response_timeout)
             
             if status != "ok":
                 return create_error_response("Worker thread error", with_readme=False)
@@ -10811,16 +10691,22 @@ def handle_enable_bluetooth(params: Dict) -> Dict:
 def handle_terminal(input_param: Dict) -> Dict:
     """Handle MCU serial tool operations via MCP interface"""
     try:
-        # Pop off synthetic handler_info parameter early
-        handler_info = input_param.pop('handler_info', None)
+        # C2 fix: read (do not pop) the synthetic handler_info so we do not mutate
+        # the caller's dict. (The old code popped it, mutating the caller's dict.)
+        # It is dropped naturally when we descend into input_param["input"] below.
+        handler_info = input_param.get('handler_info', {}) if isinstance(input_param, dict) else {}
         
         if isinstance(input_param, dict) and "input" in input_param:
             input_param = input_param["input"]
 
-        # Handle readme operation first (before token validation)
         if isinstance(input_param, dict) and input_param.get("operation") == "readme":
             return {
                 "content": [{"type": "text", "text": readme(True)}],
+                "isError": False
+            }
+        if isinstance(input_param, dict) and input_param.get("operation") == "man":
+            return {
+                "content": [{"type": "text", "text": man_page()}],
                 "isError": False
             }
             
@@ -10841,6 +10727,17 @@ def handle_terminal(input_param: Dict) -> Dict:
         # Extract operation
         operation = validated_params.get("operation")
         
+        # NOTE (B1): per-caller session ownership is intentionally NOT enforced here.
+        # It cannot be done correctly from within this tool: the tool handler runs on
+        # a ThreadPoolExecutor thread where the authenticated username (request-thread
+        # -local in the framework) is not visible, and the only caller identifier the
+        # framework passes in handler_info is the per-connection MCP session id, which
+        # this client re-creates per call - so keying ownership on it would deny the
+        # normal "open in one call, use in the next" happy path. handler_info is read
+        # (not popped) above so the caller's dict is not mutated (review C2). Enforcing
+        # ownership needs the framework to include the authenticated user in
+        # handler_info (a server.py change) - see report.
+        
         # Route to appropriate handler
         if operation == "list_ports":
             return handle_list_ports(validated_params)
@@ -10856,8 +10753,6 @@ def handle_terminal(input_param: Dict) -> Dict:
             return handle_bleak_get_notifications(validated_params)
         elif operation == "bleak_disconnect":
             return handle_bleak_disconnect(validated_params)
-        elif operation == "run_elevated":
-            return handle_run_elevated(validated_params)
         elif operation == "open_session":
             return handle_open_session(validated_params)
         elif operation == "close_session":
@@ -10913,11 +10808,9 @@ def handle_terminal(input_param: Dict) -> Dict:
         elif operation == "get_tls_info":
             return handle_get_tls_info(validated_params)
         
-        elif operation == "readme":
-            return {
-                "content": [{"type": "text", "text": readme(True)}],
-                "isError": False
-            }
+        # Note: readme/man are handled by the early-return above (before the token
+        # check) so an unauthenticated caller can bootstrap the token; no duplicate
+        # dispatch branch is needed here (review C4).
         else:
             valid_operations = TOOLS[0]["real_parameters"]["properties"]["operation"]["enum"]
             return create_error_response(f"Unknown operation: '{operation}'. Available operations: {', '.join(valid_operations)}", with_readme=True)
